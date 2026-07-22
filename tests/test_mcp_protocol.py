@@ -13,6 +13,12 @@ import sys
 import unittest
 from typing import Any
 
+# Imported only to read _MAX_LINE_CHARS below, so the oversized-line tests
+# don't hardcode a second copy of the real cap. Every assertion in this file
+# still drives actual behaviour through the subprocess, per the module
+# docstring above -- nothing here is called in-process.
+import perplexity_agent_mcp as srv
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SERVER = REPO_ROOT / "perplexity_agent_mcp.py"
 
@@ -189,6 +195,160 @@ class TestTransport(unittest.TestCase):
         for line in proc.stdout.splitlines():
             if line.strip():
                 json.loads(line)  # raises if a frame was split across lines
+
+
+class TestReadLoopSurvival(unittest.TestCase):
+    """Each of these reproduces one of three review findings: a way the read
+    loop could die. The assertion that matters most in every case is the
+    LAST one -- that a well-formed request sent right after the bad input is
+    still answered -- since that's what proves the loop survived, not merely
+    that one error frame happened to look right.
+    """
+
+    def test_deeply_nested_array_yields_parse_error_and_loop_survives(self) -> None:
+        """Finding 1: CPython's C-accelerated json.loads raises
+        RecursionError, not json.JSONDecodeError, on sufficiently deep
+        nesting. Uncaught, this killed the process outright: exit code 1, a
+        bare traceback on stderr, zero stdout lines -- a ping sent right
+        after never got answered. 500,000 levels reproduces it in well under
+        a second, generated in memory; no on-disk fixture needed.
+        """
+        deeply_nested = "[" * 500_000 + "]" * 500_000
+        stdin = f'{deeply_nested}\n{{"jsonrpc":"2.0","id":9,"method":"ping"}}\n'
+        proc = subprocess.run(
+            [sys.executable, str(SERVER)],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        replies = [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
+        self.assertEqual(proc.returncode, 0, f"server crashed; stderr: {proc.stderr}")
+        self.assertEqual(replies[0]["error"]["code"], -32700)
+        self.assertIsNone(replies[0]["id"])
+        self.assertEqual(replies[-1], {"jsonrpc": "2.0", "id": 9, "result": {}})
+
+    def test_invalid_utf8_yields_error_and_loop_survives_under_strict_decoding(self) -> None:
+        """Finding 2: `for line in stdin:` decodes UTF-8 itself, outside any
+        try/except. It survived on a default install only because Python's
+        UTF-8 mode currently defaults stdin to errors="surrogateescape" -- an
+        environment default, not a guarantee. PYTHONIOENCODING=utf-8:strict
+        (set explicitly below -- a legitimate, unexotic configuration)
+        reproducibly turned the same input into an uncaught
+        UnicodeDecodeError before this fix: exit code 1, zero stdout lines.
+
+        The garbage line is invalid UTF-8 standing alone, not embedded inside
+        an otherwise-valid JSON string, so once errors="replace" turns it
+        into U+FFFD characters it still fails to parse as JSON -- a
+        deterministic -32700, regardless of which decode-error mode was
+        ambient beforehand.
+        """
+        raw = b"\xff\xfe\xfd\n" + b'{"jsonrpc":"2.0","id":9,"method":"ping"}\n'
+        proc = subprocess.run(
+            [sys.executable, str(SERVER)],
+            input=raw,
+            capture_output=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8:strict"},
+            check=False,
+        )
+        stdout = proc.stdout.decode("utf-8")
+        replies = [json.loads(x) for x in stdout.splitlines() if x.strip()]
+        self.assertEqual(proc.returncode, 0, f"server crashed; stderr: {proc.stderr!r}")
+        self.assertEqual(replies[0]["error"]["code"], -32700)
+        self.assertEqual(replies[-1], {"jsonrpc": "2.0", "id": 9, "result": {}})
+
+    def test_invalid_utf8_behaves_the_same_without_the_strict_override(self) -> None:
+        """Same fixture, ambient decode-error mode (no PYTHONIOENCODING
+        override at all). Confirms the fix does not merely paper over strict
+        mode specifically: main() now always reconfigures stdin's error
+        handler itself, so both configurations produce the identical
+        observable outcome instead of the loop's survival depending on
+        whichever default happened to be active.
+        """
+        raw = b"\xff\xfe\xfd\n" + b'{"jsonrpc":"2.0","id":9,"method":"ping"}\n'
+        proc = subprocess.run(
+            [sys.executable, str(SERVER)],
+            input=raw,
+            capture_output=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin"},
+            check=False,
+        )
+        stdout = proc.stdout.decode("utf-8")
+        replies = [json.loads(x) for x in stdout.splitlines() if x.strip()]
+        self.assertEqual(proc.returncode, 0, f"server crashed; stderr: {proc.stderr!r}")
+        self.assertEqual(replies[0]["error"]["code"], -32700)
+        self.assertEqual(replies[-1], {"jsonrpc": "2.0", "id": 9, "result": {}})
+
+    def test_oversized_line_yields_error_and_loop_survives(self) -> None:
+        """Finding 3: no bound existed on a single incoming line, unlike
+        BAND 2's _MAX_RESPONSE_BYTES for HTTP responses. This is hardening,
+        not a crash reproduction -- "before" is simply the absence of any
+        cap, so this test only characterises "after": the cap fires at
+        _MAX_LINE_CHARS + 1 characters, the rest of the line is drained
+        rather than left to desynchronise the stream, and the next line is
+        still answered.
+        """
+        oversized = "x" * (srv._MAX_LINE_CHARS + 1)
+        stdin = f'{oversized}\n{{"jsonrpc":"2.0","id":9,"method":"ping"}}\n'
+        proc = subprocess.run(
+            [sys.executable, str(SERVER)],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        replies = [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
+        self.assertEqual(proc.returncode, 0, f"server crashed; stderr: {proc.stderr}")
+        self.assertEqual(replies[0]["error"]["code"], -32600)
+        self.assertIsNone(replies[0]["id"])
+        self.assertEqual(replies[-1], {"jsonrpc": "2.0", "id": 9, "result": {}})
+
+    def test_line_of_exactly_the_cap_is_accepted(self) -> None:
+        """The cap must be inclusive: exactly _MAX_LINE_CHARS characters of
+        content is a legitimate (if extreme) line, not an oversized one --
+        proving the boundary sits where the code claims, not off by one in
+        whichever direction happens to be safe.
+        """
+        request = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"})
+        line = request + " " * (srv._MAX_LINE_CHARS - len(request))
+        self.assertEqual(len(line), srv._MAX_LINE_CHARS)
+        proc = subprocess.run(
+            [sys.executable, str(SERVER)],
+            input=line + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        replies = [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
+        self.assertEqual(replies, [{"jsonrpc": "2.0", "id": 9, "result": {}}])
+
+    def test_final_unterminated_line_of_exactly_the_cap_is_accepted(self) -> None:
+        """Same boundary, but with no trailing newline at all -- true EOF
+        right after exactly _MAX_LINE_CHARS characters, nothing more on
+        stdin. This is the ONE case that actually distinguishes `>` from
+        `>=` in the overflow check: a padded line WITH a trailing newline
+        (the test above) always short-circuits on chunk.endswith("\\n")
+        before the length comparison can matter, so only this unterminated
+        variant proves the boundary isn't off by one.
+        """
+        request = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"})
+        line = request + " " * (srv._MAX_LINE_CHARS - len(request))
+        self.assertEqual(len(line), srv._MAX_LINE_CHARS)
+        proc = subprocess.run(
+            [sys.executable, str(SERVER)],
+            input=line,  # deliberately no trailing "\n"
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        replies = [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
+        self.assertEqual(replies, [{"jsonrpc": "2.0", "id": 9, "result": {}}])
 
 
 if __name__ == "__main__":

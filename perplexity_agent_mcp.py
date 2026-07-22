@@ -36,6 +36,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover - version-depe
     )
     raise SystemExit(1)
 
+import io
 import json
 import os
 import random
@@ -612,6 +613,25 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
+# A generous cap on a single incoming request line, enforced by serve() below.
+# BAND 2's _MAX_RESPONSE_BYTES bounds a response from Perplexity: a remote
+# peer reached over the open internet, where "generous but bounded" is a real
+# security boundary against a hostile or compromised server. This constant
+# bounds the opposite direction — a request line from the LOCAL MCP client —
+# which is a fundamentally different trust boundary: the operator controls
+# both ends of that pipe (their own client, e.g. Claude Desktop or Claude
+# Code, talking to their own copy of this server they just audited). So this
+# cap is hardening against a runaway or buggy client, not a defense against a
+# hostile one. That is also why it can be smaller than BAND 2's 32 MiB: every
+# legitimate request this server accepts — a query string, a preset, an
+# optional recency filter or domain list, a response_id — is structurally
+# tiny next to a fetched research answer carrying up to 50 sources. The unit
+# here is CHARACTERS, not bytes: serve() reads through a TextIO already
+# decoded from UTF-8, so bytes are simply not the currency available at this
+# layer (see serve()'s docstring for how the cap is enforced without ever
+# materialising an oversized line in memory first).
+_MAX_LINE_CHARS = 8 * 1024 * 1024
+
 
 def _response(request_id: object, result: dict[str, object]) -> dict[str, object]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -701,16 +721,86 @@ def _log(message: str) -> None:
     _STDERR.flush()
 
 
+def _drain_line(stdin: TextIO) -> None:
+    """Discard the remainder of an oversized line, one bounded chunk at a time.
+
+    Called only after serve() has already determined a line exceeds
+    _MAX_LINE_CHARS. We still have to consume the rest of it — otherwise the
+    tail of this "line" would be misread as the start of the next one — but
+    we must not do that by materialising it whole, which would defeat the
+    entire point of the cap. Reuses the same readline(_MAX_LINE_CHARS)
+    technique serve() uses to detect the overflow in the first place: each
+    call holds at most one bounded chunk in memory, however long the real
+    line turns out to be. Stops at the first chunk that ends in a newline
+    (the true end of the line, now reached) or at EOF (an oversized FINAL
+    line with no trailing newline at all is still fully drained, in bounded
+    pieces, not left half-consumed).
+    """
+    while True:
+        chunk = stdin.readline(_MAX_LINE_CHARS)
+        if not chunk or chunk.endswith("\n"):
+            return
+
+
 def serve(stdin: TextIO, stdout: TextIO) -> int:
-    """Read newline-delimited JSON-RPC until EOF."""
-    for line in stdin:
-        line = line.strip()
+    """Read newline-delimited JSON-RPC until EOF.
+
+    The read loop must never die — that is the one hard requirement this
+    function exists to satisfy, and three distinct failure modes threaten it:
+
+    1. A line that parses as JSON but nests deep enough raises RecursionError,
+       not json.JSONDecodeError. CPython's C-accelerated decoder recurses one
+       stack frame per nesting level and guards its own C stack directly, so
+       a several-hundred-thousand-deep array overflows that guard rather than
+       producing an ordinary decode error. Caught alongside JSONDecodeError.
+    2. A line containing bytes that are not valid UTF-8 would otherwise raise
+       UnicodeDecodeError from INSIDE this stream's own text decoding —
+       outside any try/except this function could wrap around json.loads.
+       Handled upstream, in main(): reconfiguring stdin's error handler to
+       "replace" means undecodable bytes have already become U+FFFD by the
+       time any line reaches here, so decoding itself can no longer raise —
+       the resulting text then fails json.loads cleanly (or doesn't) like any
+       other malformed input.
+    3. A single line with no newline could otherwise grow this process's
+       memory without bound before a delimiter ever arrived to act on.
+       `for line in stdin:` cannot express a cap here: it fully materialises
+       one line before ever handing it to this function's body. Reading via
+       readline(_MAX_LINE_CHARS + 1) instead does: readline(n) stops at n
+       characters OR a newline, whichever comes first, so a result that is
+       exactly _MAX_LINE_CHARS + 1 characters long AND does not end in a
+       newline can only mean the real line is longer than we allow — and we
+       know that without ever holding more than that one bounded chunk. On
+       overflow we drain and discard the remainder (see _drain_line) rather
+       than silently truncating, which would just turn one oversized message
+       into a confusing parse error further down, and report it with -32600:
+       the same code already used for "syntactically-parseable JSON we still
+       won't accept" (see the array check below) — an oversized line is that
+       same category, we just never get far enough to see the JSON.
+    """
+    while True:
+        chunk = stdin.readline(_MAX_LINE_CHARS + 1)
+        if not chunk:
+            break  # EOF
+
+        if len(chunk) > _MAX_LINE_CHARS and not chunk.endswith("\n"):
+            _drain_line(stdin)
+            _write(
+                stdout,
+                _error(
+                    None,
+                    INVALID_REQUEST,
+                    f"Line exceeds the {_MAX_LINE_CHARS}-character limit.",
+                ),
+            )
+            continue
+
+        line = chunk.strip()
         if not line:
             continue
 
         try:
             message = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             _write(stdout, _error(None, PARSE_ERROR, "Parse error."))
             continue
 
@@ -734,7 +824,31 @@ def _write(stdout: TextIO, message: dict[str, object]) -> None:
 
 
 def main() -> int:
-    """Entry point for both `python3 perplexity_agent_mcp.py` and the console script."""
+    """Entry point for both `python3 perplexity_agent_mcp.py` and the console script.
+
+    Reconfigures stdin's decode-error handler to "replace" before serve() (or
+    anything else) ever reads a byte, so a malformed line can no longer raise
+    UnicodeDecodeError out of the middle of stream iteration — see point 2 of
+    serve()'s docstring. This is NOT redundant with the ambient default:
+    Python's UTF-8 mode currently defaults stdin to errors="surrogateescape",
+    which happens to avoid that same crash today, but that is an interpreter
+    default this program does not control, not a guarantee — a client
+    launched with PYTHONIOENCODING=utf-8:strict in its environment (a
+    legitimate, unexotic configuration) overrides it straight back to
+    "strict". Reconfiguring explicitly here means the loop's survival no
+    longer depends on which default happened to be active.
+
+    The isinstance check exists because sys.stdin is typed as `TextIO`, which
+    has no `reconfigure` — only io.TextIOWrapper, its concrete runtime type in
+    every normal CPython process, does. Narrowing with isinstance (rather
+    than typing.cast) satisfies mypy --strict honestly, with a real runtime
+    check standing behind it: on the vanishingly unlikely chance something has
+    replaced sys.stdin with a stream that isn't a TextIOWrapper, this simply
+    skips the reconfigure and falls back to the ambient default rather than
+    crashing on a missing attribute.
+    """
+    if isinstance(sys.stdin, io.TextIOWrapper):
+        sys.stdin.reconfigure(errors="replace")
     return serve(sys.stdin, _STDOUT)
 
 
