@@ -372,5 +372,95 @@ class TestSpotlighting(unittest.TestCase):
         self.assertLess(body.index("may be partial"), body.index("First part."))
 
 
+QUEUED: dict[str, object] = {"id": "resp_x", "status": "queued", "output": []}
+RUNNING: dict[str, object] = {
+    "id": "resp_x",
+    "status": "in_progress",
+    "output": [{"type": "search_results", "results": [{"url": "https://a", "title": "A"}]}],
+}
+
+
+class TestSubmit(TestRequest):
+    def test_submit_sends_background_true_and_the_preset(self) -> None:
+        self.fake.script((200, {"id": "resp_x", "status": "queued"}))
+        response_id = srv._submit("why?", "medium", None, None)
+        self.assertEqual(response_id, "resp_x")
+        _, path, body = self.fake.requests[0]
+        self.assertEqual(path, "/v1/agent")
+        self.assertIs(body["background"], True)
+        self.assertEqual(body["input"], "why?")
+        self.assertEqual(body["preset"], "medium")
+        self.assertEqual(body["tools"], [{"type": "web_search"}])
+        self.assertNotIn("model", body, "model is deliberately never sent")
+
+    def test_filters_are_nested_under_the_web_search_tool(self) -> None:
+        self.fake.script((200, {"id": "resp_x", "status": "queued"}))
+        srv._submit("why?", "high", "week", ["nasa.gov", "-reddit.com"])
+        _, _, body = self.fake.requests[0]
+        filters = body["tools"][0]["filters"]
+        self.assertEqual(filters["search_recency_filter"], "week")
+        self.assertEqual(filters["search_domain_filter"], ["nasa.gov", "-reddit.com"])
+
+    def test_filters_omitted_entirely_when_unused(self) -> None:
+        self.fake.script((200, {"id": "resp_x", "status": "queued"}))
+        srv._submit("why?", "fast", None, None)
+        _, _, body = self.fake.requests[0]
+        self.assertNotIn("filters", body["tools"][0])
+
+    def test_submit_rejects_a_response_without_an_id(self) -> None:
+        self.fake.script((200, {"status": "queued"}))
+        with self.assertRaises(srv.PerplexityError):
+            srv._submit("why?", "medium", None, None)
+
+
+class TestPoll(TestRequest):
+    def test_returns_immediately_when_already_terminal(self) -> None:
+        self.fake.script((200, COMPLETED))
+        payload, terminal = srv._poll("resp_x", budget=10)
+        self.assertTrue(terminal)
+        self.assertEqual(payload["status"], "completed")
+
+    def test_polls_until_terminal(self) -> None:
+        self.fake.script((200, QUEUED), (200, RUNNING), (200, COMPLETED))
+        _payload, terminal = srv._poll("resp_x", budget=30)
+        self.assertTrue(terminal)
+        self.assertGreaterEqual(len(self.fake.requests), 3)
+
+    def test_gives_up_at_the_budget_without_cancelling(self) -> None:
+        """A blown budget must hand back recoverable state, never destroy it."""
+        self.fake.script((200, RUNNING))
+        payload, terminal = srv._poll("resp_x", budget=0.1)
+        self.assertFalse(terminal)
+        self.assertEqual(payload["status"], "in_progress")
+        cancels = [r for r in self.fake.requests if r[1].endswith("/cancel")]
+        self.assertEqual(cancels, [], "budget expiry must NOT cancel the run")
+
+    def test_invokes_the_progress_callback_when_supplied(self) -> None:
+        self.fake.script((200, RUNNING), (200, COMPLETED))
+        seen: list[str] = []
+        srv._poll("resp_x", budget=30, notify=seen.append)
+        self.assertTrue(seen)
+        self.assertIn("status", seen[0])
+
+    def test_rejects_a_malformed_response_id(self) -> None:
+        with self.assertRaises(srv.PerplexityError):
+            srv._poll("../../etc/passwd", budget=1)
+
+
+class TestCancel(TestRequest):
+    def test_cancel_posts_to_the_cancel_path(self) -> None:
+        self.fake.script((200, {"response_id": "resp_x", "status": "cancelling"}))
+        message = srv._cancel("resp_x")
+        self.assertIn("cancel", message.lower())
+        self.assertEqual(self.fake.requests[0][1], "/v1/agent/resp_x/cancel")
+
+    def test_cancel_never_mentions_billing(self) -> None:
+        """Cancelled runs report no usage at all, so any cost claim is invented."""
+        self.fake.script((200, {"response_id": "resp_x", "status": "cancelling"}))
+        message = srv._cancel("resp_x").lower()
+        for word in ("bill", "cost", "charge", "refund", "money", "save"):
+            self.assertNotIn(word, message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -407,6 +407,116 @@ def _format_answer(payload: dict[str, object]) -> str:
     return _spotlight(body)
 
 
+# --- Running a research job --------------------------------------------------
+
+ProgressFn = Callable[[str], None]
+
+# Statuses from which a run will never move again.
+TERMINAL = frozenset({"completed", "failed", "incomplete", "cancelled"})
+
+_POLL_INTERVAL_START = 2.0
+_POLL_INTERVAL_MAX = 5.0
+
+
+def _wait_budget() -> int:
+    """Seconds a blocking call may wait, from the environment or the default."""
+    raw = os.environ.get("PERPLEXITY_AGENT_WAIT_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return WAIT_SECONDS_DEFAULT
+        if parsed > 0:
+            return parsed
+    return WAIT_SECONDS_DEFAULT
+
+
+def _submit(query: str, preset: str, recency: str | None, domains: list[str] | None) -> str:
+    """Start a run in background mode and return its id.
+
+    Always `background: true`, for every preset. One code path, and each HTTP
+    call stays short — a network blip cannot kill a long-running job because we
+    are not holding a socket open across it.
+
+    `model` is deliberately never sent: anthropic/* models reject requests that
+    omit max_output_tokens, and model ids drift. The preset selects the model
+    and tracks Perplexity's own updates.
+    """
+    web_search: dict[str, object] = {"type": "web_search"}
+    filters: dict[str, object] = {}
+    if recency:
+        filters["search_recency_filter"] = recency
+    if domains:
+        filters["search_domain_filter"] = domains
+    if filters:
+        # Omitted entirely when unused — an empty filters object is a needless
+        # deviation from the documented request shape.
+        web_search["filters"] = filters
+
+    payload = _request(
+        "POST",
+        "/v1/agent",
+        {
+            "input": query,
+            "preset": preset,
+            "background": True,
+            "tools": [web_search],
+        },
+    )
+    response_id = payload.get("id")
+    if not isinstance(response_id, str) or not response_id:
+        raise PerplexityError("Perplexity accepted the request but returned no id.")
+    return _validate_response_id(response_id)
+
+
+def _poll(
+    response_id: str, budget: float, notify: ProgressFn | None = None
+) -> tuple[dict[str, object], bool]:
+    """Poll until the run reaches a terminal status or the budget expires.
+
+    Returns (payload, is_terminal). On budget expiry the caller gets the latest
+    payload and False — it does NOT cancel. Cancelling on timeout would destroy
+    work the user has already paid for; handing back the id lets a blown budget
+    degrade into the asynchronous path instead of into nothing.
+    """
+    _validate_response_id(response_id)
+    started = time.monotonic()
+    interval = _POLL_INTERVAL_START
+    payload: dict[str, object] = {}
+
+    while True:
+        payload = _request("GET", f"/v1/agent/{response_id}")
+        status = payload.get("status")
+        if isinstance(status, str) and status in TERMINAL:
+            return payload, True
+
+        elapsed = time.monotonic() - started
+        if elapsed >= budget:
+            return payload, False
+
+        if notify is not None:
+            notify(_progress_summary(payload, elapsed))
+
+        # Don't overshoot the budget just to complete a sleep.
+        time.sleep(min(interval, max(0.0, budget - elapsed)))
+        interval = min(interval * 1.5, _POLL_INTERVAL_MAX)
+
+
+def _cancel(response_id: str) -> str:
+    """Ask Perplexity to stop a run.
+
+    Says nothing about billing, and must never be changed to. Cancelled runs
+    report no `usage` and no `cost` at all, so "not billed" and "billed but not
+    reported" are indistinguishable from the outside, and the docs are silent.
+    """
+    _validate_response_id(response_id)
+    _request("POST", f"/v1/agent/{response_id}/cancel")
+    return (
+        f"Cancellation requested for {response_id}. The run stops shortly after; "
+        "check with perplexity_agent_result if you need its terminal status."
+    )
+
+
 def main() -> int:
     """Entry point. Implemented in Task 5."""
     raise NotImplementedError
