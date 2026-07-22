@@ -36,6 +36,15 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover - version-depe
     )
     raise SystemExit(1)
 
+import json
+import os
+import random
+import re
+import ssl
+import time
+import urllib.error
+import urllib.request
+
 __version__ = "0.1.0"
 
 # =============================================================================
@@ -60,6 +69,132 @@ SERVER_TITLE = "Perplexity Agent"
 # 55s because Claude Desktop enforces a 60s tool-call timeout that its users
 # cannot change. Clients with looser limits should raise this — see README.
 WAIT_SECONDS_DEFAULT = 55
+
+# =============================================================================
+# BAND 2 — HTTP.  The only code in this program that touches the network.
+#
+# If you are auditing where your API key can go, this section is the entire
+# answer. Nothing above it makes requests; nothing below it constructs headers.
+# =============================================================================
+
+# Explicit rather than implicit. urllib would use this context by default, but
+# writing it out means a reviewer can SEE that certificate verification is on
+# instead of having to know that it is the default.
+_SSL_CONTEXT = ssl.create_default_context()
+
+# Per-request socket timeout. Every individual call is short — we poll rather
+# than holding one socket open for the length of a research run.
+_SOCKET_TIMEOUT = 30.0
+
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 3
+
+# Response ids come back from Perplexity and are interpolated into a URL path,
+# so they are untrusted input even though the source is trusted. Constrain them.
+_RESPONSE_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+
+class PerplexityError(Exception):
+    """An upstream or transport failure, carrying a message safe to show a model.
+
+    `message` never contains the API key, request headers, or a stack trace.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _api_key() -> str:
+    """Read the key at call time so an unset key is a tool error, not a crash."""
+    key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
+    if not key:
+        raise PerplexityError(
+            "PERPLEXITY_API_KEY is not set. Add it to the 'env' block of this "
+            "server's entry in your MCP client configuration."
+        )
+    return key
+
+
+def _validate_response_id(response_id: str) -> str:
+    """Reject anything that could escape the URL path it is interpolated into."""
+    if not _RESPONSE_ID_RE.match(response_id):
+        raise PerplexityError(
+            "Malformed response_id. Expected the identifier returned by perplexity_agent."
+        )
+    return response_id
+
+
+def _error_message(payload: dict[str, object], status: int) -> str:
+    """Pull a human-readable message out of an upstream error body.
+
+    Their OpenAPI declares error.code as a string; the live API returns an
+    integer. We read only `message` and ignore `code` entirely, which sidesteps
+    the disagreement.
+    """
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return f"Perplexity returned HTTP {status}."
+
+
+def _request(method: str, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
+    """Make one API call. The single choke point for all network access.
+
+    The Authorization header exists only inside this function. It is never
+    attached to an exception, never logged, and never returned.
+    """
+    url = API_BASE + path
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+
+    last_error = "request failed"
+    for attempt in range(_MAX_ATTEMPTS):
+        request = urllib.request.Request(url, data=data, method=method)  # noqa: S310
+        request.add_header("Authorization", "Bearer " + _api_key())
+        request.add_header("User-Agent", f"perplexity-agent-mcp/{__version__}")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                request, timeout=_SOCKET_TIMEOUT, context=_SSL_CONTEXT
+            ) as response:
+                return _decode(response.read())
+        except urllib.error.HTTPError as exc:
+            payload = _safe_json(exc.read())
+            message = _error_message(payload, exc.code)
+            if exc.code not in _RETRY_STATUSES:
+                # A bad request retried is just a slower bad request.
+                raise PerplexityError(message) from None
+            last_error = message
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
+            # Deliberately record only the exception TYPE. Messages from socket
+            # and TLS errors can echo the request, and the request has our key.
+            last_error = f"network error ({type(exc).__name__})"
+
+        if attempt < _MAX_ATTEMPTS - 1:
+            # Exponential backoff with jitter. Perplexity documents no
+            # Retry-After header, and their docs prescribe exactly this.
+            time.sleep(2**attempt + random.random())  # noqa: S311
+
+    raise PerplexityError(f"{last_error} (after {_MAX_ATTEMPTS} attempts)")
+
+
+def _decode(raw: bytes) -> dict[str, object]:
+    payload = _safe_json(raw)
+    if not isinstance(payload, dict):
+        raise PerplexityError("Perplexity returned a non-object JSON response.")
+    return payload
+
+
+def _safe_json(raw: bytes) -> dict[str, object]:
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def main() -> int:
