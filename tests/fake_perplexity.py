@@ -21,6 +21,12 @@ class FakePerplexity:
         self._responses: list[tuple[int, dict[str, Any]]] = []
         self._index = 0
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
+        # Parallel to `requests` (same index, appended in the same lock), so
+        # a test can correlate request i with the exact headers it carried.
+        # Kept as a second list rather than widening the `requests` tuple to
+        # 4 elements so every existing `method, path, body = ...` unpacking
+        # elsewhere in the suite keeps working unmodified.
+        self.request_headers: list[dict[str, str]] = []
         self._lock = threading.Lock()
         # Real seconds to sleep before writing each response, opt-in (0 =
         # off). Exists for tests proving _request's deadline handling
@@ -43,6 +49,11 @@ class FakePerplexity:
                     body = {"__unparseable__": raw.decode("utf-8", "replace")}
                 with fake._lock:
                     fake.requests.append((method, self.path, body))
+                    # .items(), not dict(self.headers): Message.__getitem__
+                    # returns only the FIRST value for a repeated header,
+                    # which would silently disagree with what a plain dict
+                    # built from all (name, value) pairs records.
+                    fake.request_headers.append(dict(self.headers.items()))
                     status, payload = fake._next()
                 if fake.response_delay:
                     time.sleep(fake.response_delay)

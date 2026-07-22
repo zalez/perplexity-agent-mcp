@@ -10,10 +10,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
+
+import perplexity_agent_mcp as srv
+
+from .fake_perplexity import FakePerplexity
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SERVER = REPO_ROOT / "perplexity_agent_mcp.py"
 SENTINEL = "pplx-SENTINEL-must-never-appear-anywhere"
+# A distinct sentinel for the stdout-rebind test below: it stands in for "a
+# stray print() anywhere in the process", not for the API key, so it is kept
+# textually unrelated to SENTINEL to avoid the two properties being confused
+# for one another in a failure message.
+PRINT_SENTINEL = "PRINT-SENTINEL-must-land-on-stderr-only"
 
 INIT = {
     "jsonrpc": "2.0",
@@ -29,7 +39,8 @@ INIT = {
 
 def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
     """A throwaway copy of the server: API_BASE repointed at an unroutable
-    local address, and retries trimmed from 3 to 1.
+    local address, and the retry backoff neutralised so all three real
+    attempts complete in milliseconds instead of several real seconds.
 
     Why a patched COPY, run as its own script, rather than the plan's
     original `python -c "exec(open(...).read().replace(...))"` one-liner:
@@ -42,18 +53,28 @@ def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
     `run_server` helper), so `__name__` is "__main__" for the ordinary
     reason, and there is no shell-quoting of the repo path to get wrong.
 
-    Why _MAX_ATTEMPTS is also trimmed here: connecting to 127.0.0.1:9
-    (nothing listens there) fails instantly with ECONNREFUSED, not a
-    socket timeout, so that part is already fast. What is NOT fast is
-    _request's real exponential-backoff time.sleep() BETWEEN retries --
-    left at the real value of 3, this one test costs several real seconds
-    for a code path that adds nothing to the property being proved: the
-    Authorization header is rebuilt from the same _api_key() on every
-    attempt, so attempt 1 alone already exercises the exact place a leak
-    would happen. The upstream call this test makes is still completely
-    real -- a real socket, a real connection refusal, a real
-    PerplexityError -- only the redundant extra attempts (and their sleeps)
-    are removed, keeping the whole suite comfortably under its time budget.
+    Why _MAX_ATTEMPTS is left at its real value of 3, unpatched (an earlier
+    version of this helper trimmed it to 1 -- itself a bug, per a reviewer):
+    trimming it made _request's own retry/backoff branch --
+    `if attempt < _MAX_ATTEMPTS - 1: ...` -- structurally unreachable,
+    because with _MAX_ATTEMPTS=1 that condition is `0 < 0`, always False. A
+    leak planted inside that branch is then invisible to this test no
+    matter what it asserts, because the mutated code never runs. Left at 3,
+    attempts 0 and 1 both take that branch before the loop's third and
+    final attempt raises, so a leak planted there sits on a path this test
+    actually walks -- see the mutation evidence for Finding 1 in
+    task-7-report.md.
+
+    What IS genuinely slow, and safe to remove, is the real
+    exponential-backoff time.sleep() BETWEEN retries
+    (2**attempt + random.random() seconds, several real seconds total
+    across two backoffs): connecting to 127.0.0.1:9 itself is fast, an
+    instant ECONNREFUSED rather than a socket timeout, so patching only the
+    backoff DELAY down to zero keeps every attempt and every branch
+    completely real while removing only the dead time between them -- the
+    Authorization header is still rebuilt from a real _api_key() call on
+    every one of the three attempts, and the final exception is still the
+    product of three real failed connections, not a shortcut.
 
     A copy rather than an in-place edit: the tracked server file must
     never be touched, even transiently, by a test run.
@@ -62,26 +83,76 @@ def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
     patched = source.replace(
         'API_BASE = "https://api.perplexity.ai"', 'API_BASE = "http://127.0.0.1:9"', 1
     )
-    # Fails loudly rather than silently: if this ever stops matching (the
-    # server's source shape changed), the fallback would otherwise be a
-    # SILENT no-op patch that leaves API_BASE pointed at the real
-    # Perplexity API -- turning this security test into a live network
-    # call on every run instead of failing the way a broken assumption
-    # should.
-    assert patched != source, "API_BASE assignment not found; server source changed shape"
-    patched = patched.replace("_MAX_ATTEMPTS = 3", "_MAX_ATTEMPTS = 1", 1)
-    assert "_MAX_ATTEMPTS = 1" in patched, "_MAX_ATTEMPTS assignment not found; shape changed"
+    if patched == source:
+        # Fails loudly rather than silently. A plain `assert` here would be
+        # stripped under `python -O` (Finding 4) -- turning "the patch
+        # stopped matching" into a SILENT no-op that leaves API_BASE
+        # pointed at the real Perplexity API, i.e. a live network call
+        # with a real key on every future run of this test, instead of a
+        # clean failure right now.
+        raise AssertionError("API_BASE assignment not found; server source changed shape")
+
+    before_backoff = patched
+    patched = patched.replace("backoff = 2**attempt + random.random()", "backoff = 0.0", 1)
+    if patched == before_backoff:
+        raise AssertionError("backoff assignment not found; server source changed shape")
 
     copy_path = directory / "perplexity_agent_mcp_unroutable.py"
     copy_path.write_text(patched, encoding="utf-8")
     return copy_path
 
 
+def _forbidden_stdout_writes(tree: ast.AST) -> list[str]:
+    """Every statically-detectable way this source could write to stdout.
+
+    Three patterns, catching the reviewer's evasions of the original
+    (name-only) check:
+
+    1. `print(...)` called directly, by name.
+    2. `print` reached through attribute access, on ANY base expression --
+       `sys.modules["builtins"].print(...)`, `builtins.print(...)`,
+       `__builtins__.print(...)`, whatever it is spelled as. Matching only
+       the final `.print` attribute, not what it hangs off of, is
+       deliberate: the base expression is exactly what an evasion gets to
+       choose, so there is no fixed list of "the ways to spell builtins"
+       worth enumerating.
+    3. `sys.stdout.write(...)` written out literally.
+
+    What this can NEVER catch: an alias (`p = print; p(...)`, or
+    `w = sys.stdout.write; w(...)`). By the time that call happens, the
+    callable is just an ordinary name, indistinguishable at parse time from
+    any other function call -- no static check closes that gap.
+    TestKeyNeverLeaks.test_stray_print_is_redirected_to_stderr_not_the_protocol_stream
+    covers it instead, by pinning the RUNTIME mechanism (the
+    `sys.stdout = sys.stderr` rebind at import) that neutralises a stray
+    print() -- aliased or not -- regardless of how it was spelled.
+    """
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "print":
+            violations.append(f"line {node.lineno}: print(...)")
+        elif isinstance(func, ast.Attribute) and func.attr == "print":
+            violations.append(f"line {node.lineno}: *.print(...)")
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr == "write"
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "stdout"
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id == "sys"
+        ):
+            violations.append(f"line {node.lineno}: sys.stdout.write(...)")
+    return violations
+
+
 class TestKeyNeverLeaks(unittest.TestCase):
     def test_key_absent_from_stdout_and_stderr_on_upstream_failure(self) -> None:
         """Point a throwaway copy of the server at an unroutable address so
-        the one upstream request it makes genuinely fails, then prove the
-        key reaches neither stream.
+        the three real connection attempts it makes all genuinely fail,
+        then prove the key reaches neither stream.
 
         The shipped server deliberately has no environment-variable
         base-URL override -- that would itself be a key-exfiltration
@@ -133,16 +204,16 @@ class TestKeyNeverLeaks(unittest.TestCase):
 
     def test_source_never_prints_the_key(self) -> None:
         """stdout belongs to the protocol; diagnostics go through _log() to
-        stderr, never print().
-
-        The print() check parses the source into an AST rather than
-        scanning for the substring "print(" -- this module's own
-        stdout-discipline comments talk ABOUT print() in prose (e.g. "a
-        stray print(): stdout is reserved..."), so a plain substring scan
-        flags those comments as violations of a property they are
-        actually documenting. Walking the AST for real ast.Call nodes
-        checks what the property actually means: no CALL to print, prose
-        be damned.
+        stderr, never print() -- checked via _forbidden_stdout_writes,
+        which parses the source into an AST rather than scanning for
+        substrings like "print(": this module's own stdout-discipline
+        comments talk ABOUT print() in prose (e.g. "a stray print(): stdout
+        is reserved..."), so a plain substring scan flags those comments as
+        violations of a property they are actually documenting. Walking
+        the AST for real ast.Call nodes checks what the property actually
+        means: no CALL that reaches stdout, prose be damned. See
+        _forbidden_stdout_writes's own docstring for exactly what it does
+        and does not catch, and why.
 
         Second half: no line that writes to stderr may interpolate the key
         or the Authorization header into its message. Matched against
@@ -156,19 +227,139 @@ class TestKeyNeverLeaks(unittest.TestCase):
         """
         source = SERVER.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(SERVER))
-        print_calls = [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "print"
-        ]
-        self.assertEqual(print_calls, [], f"print() call(s) at line(s) {print_calls}; use _log()")
+        violations = _forbidden_stdout_writes(tree)
+        self.assertEqual(violations, [], f"stdout write(s) found: {violations}")
 
         for line in source.splitlines():
             if "_log(" in line or "stderr.write(" in line.lower():
                 self.assertNotIn("_api_key", line)
                 self.assertNotIn("Authorization", line)
+
+    def test_stray_print_is_redirected_to_stderr_not_the_protocol_stream(self) -> None:
+        """Pin the actual defence directly, by its runtime effect, rather
+        than relying solely on the static check above (which the Finding-2
+        mutation evidence in task-7-report.md shows an aliased call can
+        evade). Importing the real, unmodified server rebinds sys.stdout to
+        sys.stderr as an import side effect -- see the "stdout discipline"
+        comment at the top of perplexity_agent_mcp.py -- so any print()
+        call anywhere in the process, after that import, lands on stderr
+        no matter how it was written or where it came from, aliased or
+        not.
+
+        Drives a tiny driver script in a real subprocess: import the real
+        module (runs the rebind), call print() ourselves to stand in for
+        "a stray print() anywhere in the process", then actually run the
+        protocol loop for one request and prove both halves at once: the
+        print()'d text reaches stderr (proving the call genuinely ran and
+        was genuinely redirected -- not just "happened not to appear on
+        stdout" for some unrelated reason), and stdout carries nothing but
+        the one valid JSON-RPC response.
+        """
+        driver = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "import perplexity_agent_mcp as server\n"  # runs the stdout->stderr rebind
+            f"print({PRINT_SENTINEL!r}, flush=True)\n"  # must land on stderr, not stdout
+            "raise SystemExit(server.main())\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", driver],
+            input=json.dumps(INIT) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin"},
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, f"driver crashed; stderr: {proc.stderr}")
+        self.assertIn(
+            PRINT_SENTINEL,
+            proc.stderr,
+            "the print() call never reached stderr -- this test proved nothing",
+        )
+        self.assertNotIn(PRINT_SENTINEL, proc.stdout)
+
+        lines = proc.stdout.splitlines()
+        self.assertTrue(lines, "expected the initialize response on stdout")
+        frames = [json.loads(line) for line in lines]
+        self.assertEqual(frames[0].get("id"), 1)
+
+
+class TestKeyStaysOutOfUpstreamRequests(unittest.TestCase):
+    """Finding 3: a reviewer planted the key into _request's own `url`
+    construction, and every test in TestKeyNeverLeaks above passed --
+    none of them inspects what actually went out over the wire (property 1
+    never completes a real connection at all; properties 2 and 3 only ever
+    look at source text). The only thing that caught it was three
+    unrelated exact-path assertions in test_perplexity_client.py
+    (TestSubmit/TestPoll/TestCancel), protection that would silently
+    vanish the moment any one of those assertions was loosened for an
+    unrelated reason.
+
+    This class owns the property directly: drive real submit/poll/cancel
+    calls against the in-process fake upstream, then inspect exactly what
+    FakePerplexity recorded -- method, path, body, and (now that the fake
+    also records them) headers -- and assert the key appears in the
+    Authorization header of every request, and nowhere else: not the path,
+    not the query string, not the body, not any other header.
+    """
+
+    def setUp(self) -> None:
+        self.fake = FakePerplexity()
+        self._real_base = srv.API_BASE
+        srv.API_BASE = self.fake.url
+        self._env = unittest.mock.patch.dict("os.environ", {"PERPLEXITY_API_KEY": SENTINEL})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        srv.API_BASE = self._real_base
+        self.fake.close()
+
+    def test_key_appears_only_in_the_authorization_header(self) -> None:
+        self.fake.script((200, {"id": "resp_1", "status": "completed", "output": []}))
+
+        response_id = srv._submit("why?", preset="medium", recency=None, domains=None)
+        srv._poll(response_id, budget=0.01)
+        srv._cancel(response_id)
+
+        self.assertGreaterEqual(
+            len(self.fake.requests), 3, "submit + poll + cancel must all reach the fake"
+        )
+        self.assertEqual(len(self.fake.requests), len(self.fake.request_headers))
+
+        for (method, path, body), headers in zip(
+            self.fake.requests, self.fake.request_headers, strict=True
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertNotIn(SENTINEL, path, "leaked into the request path or query string")
+                self._assert_absent(body)
+
+                header_map = {name.lower(): value for name, value in headers.items()}
+                for name, value in header_map.items():
+                    if name != "authorization":
+                        self.assertNotIn(SENTINEL, value, f"leaked via header {name!r}")
+
+                # Positive half: the key DOES legitimately travel, exactly
+                # here, turning this from a negative check into a complete
+                # one -- the key must appear in Authorization AND nowhere
+                # else, not merely "nowhere I happened to look".
+                auth = header_map.get("authorization")
+                if auth is None:
+                    raise AssertionError("every upstream request must carry Authorization")
+                self.assertIn(SENTINEL, auth)
+
+    def _assert_absent(self, value: object) -> None:
+        """Recursively confirm SENTINEL is not hiding anywhere in a JSON body."""
+        if isinstance(value, str):
+            self.assertNotIn(SENTINEL, value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                self._assert_absent(item)
+        elif isinstance(value, list):
+            for item in value:
+                self._assert_absent(item)
 
 
 if __name__ == "__main__":
