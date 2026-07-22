@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unittest
 import unittest.mock
 
@@ -189,6 +190,114 @@ class TestRequest(AuthedClientTestCase):
         self.assertEqual(
             len(self.fake.requests), 1, "an oversized error body must not trigger a retry"
         )
+
+
+class TestRequestDeadline(AuthedClientTestCase):
+    """`_request`'s optional `deadline` - the fix for Finding 1: without it,
+    `_request`'s own retry loop can burn far more real time than any budget
+    a caller like `_poll` thinks it is enforcing. See `_request`'s docstring
+    for the full mechanism; these tests exercise it directly, against a
+    mocked `urlopen` rather than the fake server, so no test here waits for
+    real time beyond microseconds (TestPoll below has the one test that
+    exercises a genuinely slow upstream end to end).
+    """
+
+    @staticmethod
+    def _mock_response(payload: dict[str, object]) -> unittest.mock.MagicMock:
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        return response
+
+    def test_deadline_clamps_the_socket_timeout_to_remaining_time(self) -> None:
+        response = self._mock_response({"id": "resp_1", "status": "queued"})
+        deadline = time.monotonic() + 5.0
+        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+            srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
+        timeout = mock_urlopen.call_args.kwargs["timeout"]
+        # ~5s remaining, minus the (negligible) time spent getting here.
+        self.assertTrue(4.5 <= timeout <= 5.0, f"expected timeout near 5.0, got {timeout}")
+
+    def test_deadline_never_exceeds_the_normal_socket_timeout(self) -> None:
+        response = self._mock_response({"id": "resp_1", "status": "queued"})
+        deadline = time.monotonic() + 1000.0  # far more than _SOCKET_TIMEOUT
+        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+            srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], srv._SOCKET_TIMEOUT)
+
+    def test_deadline_floors_the_socket_timeout_at_one_second(self) -> None:
+        response = self._mock_response({"id": "resp_1", "status": "queued"})
+        deadline = time.monotonic() + 0.2  # almost no time left, but > 0
+        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+            srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
+        timeout = mock_urlopen.call_args.kwargs["timeout"]
+        self.assertEqual(timeout, 1.0, "a sub-second timeout would fire on ordinary latency")
+
+    def test_deadline_already_in_the_past_still_gets_one_bounded_attempt(self) -> None:
+        """`_poll` deliberately calls `_request` right at its own budget's
+        edge (see `_poll`'s "don't overshoot the budget" comment), so by the
+        time this function reads the clock, `deadline` has often technically
+        already passed by a few milliseconds. Refusing attempt 0 outright
+        for that would turn every graceful budget-expiry return in `_poll`
+        into a raised exception instead - see
+        TestPoll.test_gives_up_at_the_budget_without_cancelling, which this
+        behaviour is required to keep passing. One bounded (floored) attempt
+        must still be allowed to succeed.
+        """
+        response = self._mock_response({"id": "resp_1", "status": "queued"})
+        deadline = time.monotonic() - 5.0  # unambiguously already in the past
+        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+            result = srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
+        self.assertEqual(result["id"], "resp_1")
+        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 1.0, "floored, not refused")
+
+    def test_deadline_already_in_the_past_still_suppresses_a_retry(self) -> None:
+        """The one bounded attempt proven above must not become two: once
+        it fails, a deadline already spent before the call even started
+        must not be retried - that IS the unbounded-retry problem
+        `deadline` exists to prevent.
+        """
+        deadline = time.monotonic() - 5.0
+        with (
+            unittest.mock.patch(
+                "urllib.request.urlopen", side_effect=OSError("boom")
+            ) as mock_urlopen,
+            unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep,
+        ):
+            with self.assertRaises(srv.PerplexityError):
+                srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
+        self.assertEqual(mock_urlopen.call_count, 1, "one bounded attempt, never a retry")
+        mock_sleep.assert_not_called()
+
+    def test_deadline_suppresses_a_retry_that_would_overrun_it(self) -> None:
+        """A deadline still comfortably in the future when the call BEGINS,
+        but that a normal retry backoff (>=1.0s) would blow through. The
+        failure itself is instant (mocked), so the only real time spent
+        proving this is the ~0.1s built into `deadline` below.
+        """
+        deadline = time.monotonic() + 0.1
+        with (
+            unittest.mock.patch(
+                "urllib.request.urlopen", side_effect=OSError("connection reset")
+            ) as mock_urlopen,
+            unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep,
+        ):
+            with self.assertRaises(srv.PerplexityError):
+                srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
+        self.assertEqual(mock_urlopen.call_count, 1, "must not retry once backoff would overrun")
+        mock_sleep.assert_not_called()
+
+    def test_no_deadline_behaves_exactly_as_before(self) -> None:
+        """The default. `_submit` and `_cancel` call `_request` this way,
+        and every pre-existing test in TestRequest above does too - this
+        one just makes the "unaffected" claim in `_request`'s docstring
+        explicit for the one new knob this task added.
+        """
+        response = self._mock_response({"id": "resp_1", "status": "queued"})
+        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+            srv._request("GET", "/v1/agent/resp_1")
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], srv._SOCKET_TIMEOUT)
 
 
 # A realistic completed response. Field names verified against the live API on
@@ -413,6 +522,44 @@ class TestSpotlighting(unittest.TestCase):
         self.assertLess(body.index("may be partial"), body.index("First part."))
 
 
+class TestWaitBudget(unittest.TestCase):
+    """`_wait_budget` had no dedicated test before this task - it parses an
+    environment variable, so it deserves the same scrutiny as `_api_key`.
+    """
+
+    def test_returns_default_when_unset(self) -> None:
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(srv._wait_budget(), srv.WAIT_SECONDS_DEFAULT)
+
+    def test_returns_default_when_malformed(self) -> None:
+        env = {"PERPLEXITY_AGENT_WAIT_SECONDS": "soon"}
+        with unittest.mock.patch.dict("os.environ", env):
+            self.assertEqual(srv._wait_budget(), srv.WAIT_SECONDS_DEFAULT)
+
+    def test_returns_default_when_non_positive(self) -> None:
+        env = {"PERPLEXITY_AGENT_WAIT_SECONDS": "0"}
+        with unittest.mock.patch.dict("os.environ", env):
+            self.assertEqual(srv._wait_budget(), srv.WAIT_SECONDS_DEFAULT)
+
+    def test_returns_a_valid_custom_value_unchanged(self) -> None:
+        """300 is this project's own documented recommendation for
+        permissive clients - it must pass through exactly, comfortably
+        under the clamp.
+        """
+        env = {"PERPLEXITY_AGENT_WAIT_SECONDS": "300"}
+        with unittest.mock.patch.dict("os.environ", env):
+            self.assertEqual(srv._wait_budget(), 300)
+
+    def test_absurdly_large_value_is_clamped_not_returned_verbatim(self) -> None:
+        """Finding 2: every OTHER malformed input degrades to the default;
+        an oversized one used to be the sole exception, passed through
+        verbatim.
+        """
+        env = {"PERPLEXITY_AGENT_WAIT_SECONDS": "99999999999999999999"}
+        with unittest.mock.patch.dict("os.environ", env):
+            self.assertEqual(srv._wait_budget(), srv._WAIT_SECONDS_MAX)
+
+
 QUEUED: dict[str, object] = {"id": "resp_x", "status": "queued", "output": []}
 RUNNING: dict[str, object] = {
     "id": "resp_x",
@@ -461,6 +608,24 @@ class TestPoll(AuthedClientTestCase):
         self.assertTrue(terminal)
         self.assertEqual(payload["status"], "completed")
 
+    def test_poll_passes_a_deadline_computed_from_the_budget(self) -> None:
+        """Wiring proof for Finding 1: _poll must hand _request a deadline
+        derived from ITS OWN start time and budget, not leave it unbounded.
+        This only checks that the NUMBER handed over is right; the
+        TestRequestDeadline tests above prove what _request then DOES with
+        it, and test_poll_gives_up_promptly_even_when_the_upstream_is_slow
+        below proves the two work together end to end.
+        """
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._request", return_value=COMPLETED
+        ) as mock_request:
+            before = time.monotonic()
+            srv._poll("resp_x", budget=7.0)
+            after = time.monotonic()
+        deadline = mock_request.call_args.kwargs["deadline"]
+        self.assertGreaterEqual(deadline, before + 7.0)
+        self.assertLessEqual(deadline, after + 7.0)
+
     def test_polls_until_terminal(self) -> None:
         self.fake.script((200, QUEUED), (200, RUNNING), (200, COMPLETED))
         # budget=30 is far bigger than either sleep, so the poll INTERVAL
@@ -488,6 +653,46 @@ class TestPoll(AuthedClientTestCase):
         self.assertEqual(payload["status"], "in_progress")
         cancels = [r for r in self.fake.requests if r[1].endswith("/cancel")]
         self.assertEqual(cancels, [], "budget expiry must NOT cancel the run")
+
+    def test_poll_gives_up_promptly_even_when_the_upstream_is_slow(self) -> None:
+        """The overrun this fix exists for, reproduced end to end: a
+        reviewer proved that stubbing a 4-second _request made
+        _poll(budget=3.0) return at 4.01s, because _poll's own elapsed
+        check only runs BETWEEN calls, never during one already in flight.
+
+        A stub replacing _request wholesale can't prove the FIX, though -
+        the fix lives INSIDE _request (see TestRequestDeadline's class
+        docstring), and a wholesale stub bypasses it entirely. This test
+        instead makes the fake upstream itself slow (a real handler-side
+        sleep, real socket, real OS-enforced timeout) and proves the
+        CLAMPED per-attempt timeout - not _poll's own elapsed check - is
+        what now cuts the wait short.
+
+        Real timing, deliberately not mocked, same reasoning as
+        test_gives_up_at_the_budget_without_cancelling above: elapsed-time
+        behaviour against a real socket is the thing under test.
+        """
+        # Comfortably longer than the ~1.0s floored timeout a budget this
+        # small clamps every attempt to (see _request's docstring), so the
+        # client always gives up first, never the server. Short enough to
+        # keep this test itself fast even though the single-threaded fake
+        # server blocks its own shutdown() on an in-flight handler (see
+        # fake_perplexity.py's response_delay comment) - this number is a
+        # real, if small, cost paid once by this one test.
+        self.fake.response_delay = 1.3
+        started = time.monotonic()
+        with self.assertRaises(srv.PerplexityError):
+            # The clamped socket timeout fires as a real TimeoutError.
+            # _poll does not catch it - same as any other _request
+            # failure (e.g. exhausted retries on a persistent 5xx, already
+            # true before this fix). The point proven here is TIMING, not
+            # this pre-existing propagation choice.
+            srv._poll("resp_x", budget=0.3)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.3, "must return before the upstream's own delay elapses")
+        self.assertEqual(
+            len(self.fake.requests), 1, "must not retry against a slow upstream past the deadline"
+        )
 
     def test_invokes_the_progress_callback_when_supplied(self) -> None:
         self.fake.script((200, RUNNING), (200, COMPLETED))

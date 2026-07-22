@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -21,6 +22,14 @@ class FakePerplexity:
         self._index = 0
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
         self._lock = threading.Lock()
+        # Real seconds to sleep before writing each response, opt-in (0 =
+        # off). Exists for tests proving _request's deadline handling
+        # against a genuinely slow upstream rather than a stubbed function -
+        # see test_perplexity_client.py's TestPoll for the one test that
+        # sets this. Deliberately a plain float, not per-request scripting:
+        # every test that needs this wants "the upstream is slow", not a
+        # specific request singled out.
+        self.response_delay = 0.0
 
         fake = self
 
@@ -35,6 +44,8 @@ class FakePerplexity:
                 with fake._lock:
                     fake.requests.append((method, self.path, body))
                     status, payload = fake._next()
+                if fake.response_delay:
+                    time.sleep(fake.response_delay)
                 encoded = json.dumps(payload).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")

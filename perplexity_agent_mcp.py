@@ -163,17 +163,54 @@ def _read_capped(read: Callable[[int], bytes], limit: int) -> bytes:
     return chunk
 
 
-def _request(method: str, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
+def _request(
+    method: str,
+    path: str,
+    body: dict[str, object] | None = None,
+    deadline: float | None = None,
+) -> dict[str, object]:
     """Make one API call. The single choke point for all network access.
 
     The Authorization header exists only inside this function. It is never
     attached to an exception, never logged, and never returned.
+
+    `deadline`, when given, is a `time.monotonic()` timestamp this call must
+    not run past. It exists for one reason: Claude Desktop enforces a 60s
+    tool-call timeout its users cannot change — exactly why
+    WAIT_SECONDS_DEFAULT is 55, not something rounder. Without a deadline,
+    this function's OWN retry loop can burn far more time than any caller's
+    budget on its own — up to roughly `_MAX_ATTEMPTS * _SOCKET_TIMEOUT` plus
+    backoff, ~90s worst case — because `_poll`'s elapsed-time check only
+    runs BETWEEN calls to this function, never during one already in
+    flight. `deadline` closes that gap from the inside: it shortens the
+    per-attempt socket timeout to whatever time genuinely remains (floored
+    at 1s — see the comment below on why attempt 0 always gets that much),
+    and it stops the retry loop before a backoff sleep would carry past the
+    deadline, rather than after. `_submit` and `_cancel` call this with no
+    deadline and are unaffected — every deadline-driven branch below only
+    ever SHORTENS a timeout or a retry, never lengthens one, so `deadline
+    is None` reproduces the old, unbounded behaviour exactly.
     """
     url = API_BASE + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
 
     last_error = "request failed"
     for attempt in range(_MAX_ATTEMPTS):
+        timeout = _SOCKET_TIMEOUT
+        if deadline is not None:
+            # Floored at 1s rather than refused outright when already zero
+            # or negative. Two reasons: a sub-second timeout isn't useful —
+            # it would fire on ordinary latency, not just a genuinely stuck
+            # connection — and _poll deliberately times its LAST call to
+            # land right at this exact edge (see _poll's "don't overshoot
+            # the budget just to complete a sleep"), so refusing attempt 0
+            # here would turn every graceful budget-expiry return in _poll
+            # into a raised exception instead. The bounded (<=1s) worst
+            # case this floor accepts is the trade-off; the backoff check
+            # below is where a deadline that is ACTUALLY exhausted stops
+            # this loop from retrying — see there for why that is enough.
+            timeout = min(_SOCKET_TIMEOUT, max(1.0, deadline - time.monotonic()))
+
         request = urllib.request.Request(url, data=data, method=method)  # noqa: S310
         request.add_header("Authorization", "Bearer " + _api_key())
         request.add_header("User-Agent", f"perplexity-agent-mcp/{__version__}")
@@ -182,7 +219,7 @@ def _request(method: str, path: str, body: dict[str, object] | None = None) -> d
 
         try:
             with urllib.request.urlopen(  # noqa: S310
-                request, timeout=_SOCKET_TIMEOUT, context=_SSL_CONTEXT
+                request, timeout=timeout, context=_SSL_CONTEXT
             ) as response:
                 return _decode(_read_capped(response.read, _MAX_RESPONSE_BYTES))
         except urllib.error.HTTPError as exc:
@@ -207,7 +244,18 @@ def _request(method: str, path: str, body: dict[str, object] | None = None) -> d
         if attempt < _MAX_ATTEMPTS - 1:
             # Exponential backoff with jitter. Perplexity documents no
             # Retry-After header, and their docs prescribe exactly this.
-            time.sleep(2**attempt + random.random())  # noqa: S311
+            backoff = 2**attempt + random.random()  # noqa: S311
+            if deadline is not None and time.monotonic() + backoff >= deadline:
+                # Sleeping the full backoff would carry past the deadline.
+                # This is also what catches a deadline that had ALREADY
+                # passed before this call even started: attempt 0 above
+                # still got its one bounded try (see its comment), but a
+                # SECOND attempt on top of a budget that was already spent
+                # is exactly the unbounded-retry problem `deadline` exists
+                # to prevent. Give up now instead of sleeping and retrying
+                # anyway.
+                raise PerplexityError(f"{last_error} (deadline exceeded)")
+            time.sleep(backoff)
 
     raise PerplexityError(f"{last_error} (after {_MAX_ATTEMPTS} attempts)")
 
@@ -417,6 +465,16 @@ TERMINAL = frozenset({"completed", "failed", "incomplete", "cancelled"})
 _POLL_INTERVAL_START = 2.0
 _POLL_INTERVAL_MAX = 5.0
 
+# Upper clamp for PERPLEXITY_AGENT_WAIT_SECONDS. Every OTHER malformed value
+# already degrades to WAIT_SECONDS_DEFAULT (unparseable, zero, negative) — an
+# absurdly large one used to be the sole exception, passed through verbatim.
+# 1800s (30 minutes) leaves 6x headroom over the 300s this project documents
+# as the recommended setting for permissive clients (Claude Code, VS Code,
+# Cursor IDE), while still matching a real outer bound from that same
+# ecosystem — Claude Code's own documented 30-minute MCP idle timeout — so
+# nothing this project targets would still be waiting past it anyway.
+_WAIT_SECONDS_MAX = 1800
+
 
 def _wait_budget() -> int:
     """Seconds a blocking call may wait, from the environment or the default."""
@@ -427,7 +485,7 @@ def _wait_budget() -> int:
         except ValueError:
             return WAIT_SECONDS_DEFAULT
         if parsed > 0:
-            return parsed
+            return min(parsed, _WAIT_SECONDS_MAX)
     return WAIT_SECONDS_DEFAULT
 
 
@@ -482,10 +540,13 @@ def _poll(
     _validate_response_id(response_id)
     started = time.monotonic()
     interval = _POLL_INTERVAL_START
-    payload: dict[str, object] = {}
+    # Computed once and handed to every _request call below, so one slow
+    # call can't consume the whole budget on its own — see _request's
+    # docstring; this is the fix for the overrun `budget` is meant to cap.
+    deadline = started + budget
 
     while True:
-        payload = _request("GET", f"/v1/agent/{response_id}")
+        payload = _request("GET", f"/v1/agent/{response_id}", deadline=deadline)
         status = payload.get("status")
         if isinstance(status, str) and status in TERMINAL:
             return payload, True
