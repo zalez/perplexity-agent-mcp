@@ -44,6 +44,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 __version__ = "0.1.0"
 
@@ -88,6 +89,11 @@ _SOCKET_TIMEOUT = 30.0
 
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 3
+
+# Deep-research responses are large but not unbounded. This cap will never fire
+# in normal operation; it exists so a misbehaving upstream cannot grow this
+# process's memory without limit.
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 # Response ids come back from Perplexity and are interpolated into a URL path,
 # so they are untrusted input even though the source is trusted. Constrain them.
@@ -140,6 +146,22 @@ def _error_message(payload: dict[str, object], status: int) -> str:
     return f"Perplexity returned HTTP {status}."
 
 
+def _read_capped(read: Callable[[int], bytes], limit: int) -> bytes:
+    """Read at most `limit` bytes, detecting overflow instead of guessing at it.
+
+    A body of exactly `limit` bytes is legitimate and must not raise, so we ask
+    for one byte more than the cap: getting it back proves the real body is
+    larger, without ever holding more than `limit + 1` bytes in memory to find
+    that out. Callers pass a bound `.read` method rather than the response
+    object itself — the only thing this needs is a callable that reads up to
+    n bytes.
+    """
+    chunk = read(limit + 1)
+    if len(chunk) > limit:
+        raise PerplexityError(f"Perplexity response exceeded the {limit}-byte limit.")
+    return chunk
+
+
 def _request(method: str, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
     """Make one API call. The single choke point for all network access.
 
@@ -161,14 +183,21 @@ def _request(method: str, path: str, body: dict[str, object] | None = None) -> d
             with urllib.request.urlopen(  # noqa: S310
                 request, timeout=_SOCKET_TIMEOUT, context=_SSL_CONTEXT
             ) as response:
-                return _decode(response.read())
+                return _decode(_read_capped(response.read, _MAX_RESPONSE_BYTES))
         except urllib.error.HTTPError as exc:
-            payload = _safe_json(exc.read())
-            message = _error_message(payload, exc.code)
-            if exc.code not in _RETRY_STATUSES:
-                # A bad request retried is just a slower bad request.
-                raise PerplexityError(message) from None
-            last_error = message
+            # HTTPError is itself a file-like response object wrapping a live
+            # connection. Close it explicitly on every path out of this block,
+            # including the re-raise below, rather than leaving it to garbage
+            # collection: CPython's refcounting happens to finalize it
+            # promptly, but that is an implementation detail the language does
+            # not guarantee, and skipping the close emits a real ResourceWarning.
+            with exc:
+                payload = _safe_json(_read_capped(exc.read, _MAX_RESPONSE_BYTES))
+                message = _error_message(payload, exc.code)
+                if exc.code not in _RETRY_STATUSES:
+                    # A bad request retried is just a slower bad request.
+                    raise PerplexityError(message) from None
+                last_error = message
         except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
             # Deliberately record only the exception TYPE. Messages from socket
             # and TLS errors can echo the request, and the request has our key.

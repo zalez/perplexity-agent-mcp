@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import unittest.mock
 
@@ -106,6 +107,46 @@ class TestRequest(ClientTestCase):
         with self.assertRaises(srv.PerplexityError):
             srv._request("POST", "/v1/agent", {"input": "x"})
         self.assertEqual(len(self.fake.requests), 1, "4xx must not be retried")
+
+    def test_response_of_exactly_the_cap_size_is_accepted(self) -> None:
+        """The cap is inclusive: a body of exactly the limit must not raise.
+
+        Proves `_read_capped`'s off-by-one handling - it asks for one byte
+        more than the limit to detect overflow, so an exact-size body must
+        come back whole rather than being mistaken for a truncated one.
+        """
+        payload = {"id": "resp_1", "status": "queued", "pad": "x" * 40}
+        exact_size = len(json.dumps(payload).encode("utf-8"))
+        with unittest.mock.patch.object(srv, "_MAX_RESPONSE_BYTES", exact_size):
+            self.fake.script((200, payload))
+            result = srv._request("GET", "/v1/agent/resp_1")
+        self.assertEqual(result["id"], "resp_1")
+
+    def test_response_over_cap_raises_clear_error_without_retry(self) -> None:
+        payload = {"id": "resp_1", "status": "queued", "pad": "x" * 100}
+        with unittest.mock.patch.object(srv, "_MAX_RESPONSE_BYTES", 16):
+            self.fake.script((200, payload))
+            with self.assertRaises(srv.PerplexityError) as ctx:
+                srv._request("GET", "/v1/agent/resp_1")
+        self.assertIn("exceeded", ctx.exception.message)
+        self.assertEqual(len(self.fake.requests), 1, "an oversized body must not trigger a retry")
+
+    def test_error_body_over_cap_raises_without_leaking_key_or_retrying(self) -> None:
+        """Same cap, exercised on the HTTPError path with a 500 — normally
+        retryable — to prove the size check pre-empts the retry decision
+        rather than being silently swallowed by it, and that the resulting
+        message is still safe to show a model.
+        """
+        payload = {"error": {"message": "x" * 100}}
+        with unittest.mock.patch.object(srv, "_MAX_RESPONSE_BYTES", 16):
+            self.fake.script((500, payload))
+            with self.assertRaises(srv.PerplexityError) as ctx:
+                srv._request("GET", "/v1/agent/resp_1")
+        self.assertIn("exceeded", ctx.exception.message)
+        self.assertNotIn("pplx-test-key", ctx.exception.message)
+        self.assertEqual(
+            len(self.fake.requests), 1, "an oversized error body must not trigger a retry"
+        )
 
 
 if __name__ == "__main__":

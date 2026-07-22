@@ -19,6 +19,7 @@ ALLOWED = frozenset(
     {
         "__future__",
         "argparse",
+        "collections.abc",
         "json",
         "os",
         "random",
