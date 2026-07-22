@@ -46,6 +46,26 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from typing import TextIO
+
+# --- stdout discipline -------------------------------------------------------
+# The single most common way to break a hand-written MCP server is a stray
+# print(): stdout is reserved exclusively for protocol frames, and one extra
+# line corrupts the stream. The client's symptom is a baffling parse error
+# rather than an obvious crash.
+#
+# So: grab the real stdout, then point sys.stdout at stderr. After this, any
+# accidental print() anywhere in the process is harmless noise on stderr.
+#
+# This sits after the import block rather than textually right after the
+# version guard (as originally sketched) because the imports Task 2 placed
+# between them are themselves after the guard already, and a plain (non-dunder)
+# assignment ahead of an import block trips ruff's E402 — see the commit
+# message for the full reasoning. It still runs before __version__ is even
+# defined, i.e. before any of this module's own code could possibly print.
+_STDOUT = sys.stdout
+_STDERR = sys.stderr
+sys.stdout = sys.stderr
 
 __version__ = "0.1.0"
 
@@ -578,9 +598,144 @@ def _cancel(response_id: str) -> str:
     )
 
 
+# =============================================================================
+# BAND 4 — MCP.  JSON-RPC 2.0 over newline-delimited stdio.
+#
+# Every method this server understands is one entry in HANDLERS. If you want to
+# know what this program can be asked to do, read that dict — it is the whole
+# surface.
+# =============================================================================
+
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+
+
+def _response(request_id: object, result: dict[str, object]) -> dict[str, object]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _error(request_id: object, code: int, message: str) -> dict[str, object]:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def handle_initialize(params: dict[str, object]) -> dict[str, object]:
+    """Negotiate a protocol version.
+
+    The spec is explicit that a server MUST answer with a version it supports —
+    NOT an error — when it cannot honour the client's request. Erroring here
+    breaks clients that would otherwise have happily downgraded.
+    """
+    requested = params.get("protocolVersion")
+    version = (
+        requested
+        if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS
+        else PROTOCOL_VERSION
+    )
+    return {
+        "protocolVersion": version,
+        # The PRESENCE of the tools key is the declaration. listChanged is
+        # omitted because our tool list is static and we will never send the
+        # corresponding notification.
+        "capabilities": {"tools": {}},
+        "serverInfo": {
+            "name": SERVER_NAME,
+            "title": SERVER_TITLE,
+            "version": __version__,
+        },
+    }
+
+
+def handle_ping(params: dict[str, object]) -> dict[str, object]:
+    return {}
+
+
+def handle_tools_list(params: dict[str, object]) -> dict[str, object]:
+    return {"tools": []}  # populated in Task 6
+
+
+HANDLERS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
+    "initialize": handle_initialize,
+    "ping": handle_ping,
+    "tools/list": handle_tools_list,
+}
+
+
+def dispatch(message: dict[str, object]) -> dict[str, object] | None:
+    """Route one parsed message. Returns None for notifications."""
+    request_id = message.get("id")
+    is_notification = "id" not in message
+    method = message.get("method")
+
+    if not isinstance(method, str):
+        return None if is_notification else _error(request_id, INVALID_REQUEST, "Missing method.")
+
+    handler = HANDLERS.get(method)
+    if handler is None:
+        # Notifications MUST NOT be answered, even unknown ones.
+        return (
+            None
+            if is_notification
+            else _error(request_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        )
+
+    if is_notification:
+        return None
+
+    params = message.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    try:
+        return _response(request_id, handler(params))
+    except Exception as exc:  # broad and intentional: the read loop must never die
+        _log(f"internal error in {method}: {type(exc).__name__}")
+        return _error(request_id, INTERNAL_ERROR, "Internal server error.")
+
+
+def _log(message: str) -> None:
+    """Diagnostics go to stderr. stdout belongs to the protocol alone."""
+    _STDERR.write(f"[perplexity-agent-mcp] {message}\n")
+    _STDERR.flush()
+
+
+def serve(stdin: TextIO, stdout: TextIO) -> int:
+    """Read newline-delimited JSON-RPC until EOF."""
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            _write(stdout, _error(None, PARSE_ERROR, "Parse error."))
+            continue
+
+        if not isinstance(message, dict):
+            # JSON-RPC batching was removed from MCP in 2025-06-18, so an array
+            # is no longer a valid message.
+            _write(stdout, _error(None, INVALID_REQUEST, "Invalid request."))
+            continue
+
+        reply = dispatch(message)
+        if reply is not None:
+            _write(stdout, reply)
+
+    return 0
+
+
+def _write(stdout: TextIO, message: dict[str, object]) -> None:
+    """Emit exactly one line. json.dumps never emits a raw newline without indent."""
+    stdout.write(json.dumps(message) + "\n")
+    stdout.flush()
+
+
 def main() -> int:
-    """Entry point. Implemented in Task 5."""
-    raise NotImplementedError
+    """Entry point for both `python3 perplexity_agent_mcp.py` and the console script."""
+    return serve(sys.stdin, _STDOUT)
 
 
 if __name__ == "__main__":

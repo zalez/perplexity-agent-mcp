@@ -54,7 +54,15 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "S", "RUF", "ANN"]
 ignore = ["ANN401"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "ANN"]  # asserts and loose annotations are fine in tests
+# S101/ANN: asserts and loose annotations are fine in tests.
+# S603: every subprocess-driven protocol test calls subprocess.run() with a
+# fixed argv ([sys.executable, str(SERVER)]) — never shell=True, never
+# attacker-controlled input. Bandit's "audit every subprocess call" warning
+# is a structural false positive for this whole file's testing strategy
+# (tests/test_mcp_protocol.py drives the server as a real subprocess
+# deliberately, to catch stdout/framing bugs in-process tests would miss),
+# not a one-off worth a noqa at each of its several call sites.
+"tests/*" = ["S101", "ANN", "S603"]
 
 [tool.mypy]
 python_version = "3.10"
