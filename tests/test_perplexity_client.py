@@ -212,7 +212,7 @@ class TestRequest(AuthedClientTestCase):
 
     def test_error_body_over_cap_raises_without_leaking_key_or_retrying(self) -> None:
         """Same cap, exercised on the HTTPError path with a 500 — normally
-        retryable — to prove the size check pre-empts the retry decision
+        retryable — to prove the size check preempts the retry decision
         rather than being silently swallowed by it, and that the resulting
         message is still safe to show a model.
         """

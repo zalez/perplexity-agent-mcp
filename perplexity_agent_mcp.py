@@ -523,7 +523,7 @@ _POLL_INTERVAL_START = 2.0
 _POLL_INTERVAL_MAX = 5.0
 
 # Upper clamp for PERPLEXITY_AGENT_WAIT_SECONDS. Every OTHER malformed value
-# already degrades to WAIT_SECONDS_DEFAULT (unparseable, zero, negative) — an
+# already degrades to WAIT_SECONDS_DEFAULT (unparsable, zero, negative) — an
 # absurdly large one used to be the sole exception, passed through verbatim.
 # 1800s (30 minutes) leaves 6x headroom over the 300s this project documents
 # as the recommended setting for permissive clients (Claude Code, VS Code,

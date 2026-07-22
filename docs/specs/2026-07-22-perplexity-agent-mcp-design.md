@@ -488,7 +488,7 @@ Answer and source list are truncated to a documented cap so a runaway
 | Unhandled exception in tool body | `isError: true` |
 | Unhandled exception in dispatcher | `-32603` |
 | Line parses to a JSON array (batching removed) | `-32600` |
-| Unparseable line | `-32700`, `id: null` |
+| Unparsable line | `-32700`, `id: null` |
 | Any notification, known or unknown | **no response at all** |
 | EOF on stdin | clean exit 0 |
 
