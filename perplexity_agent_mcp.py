@@ -26,10 +26,13 @@ import sys
 # --- Python version guard ----------------------------------------------------
 # Checked before anything else runs. A clear message beats a SyntaxError from
 # deep inside the file, which is what an older interpreter would otherwise emit.
-if sys.version_info < (3, 10):  # pragma: no cover - version-dependent
+#
+# ruff's UP036 calls this dead code because target-version is py310 — but that
+# is precisely the assumption this guard exists to check. It runs on exactly
+# the interpreters where ruff's premise is false, so the check stays.
+if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover - version-dependent
     sys.stderr.write(
-        "perplexity-agent-mcp requires Python 3.10 or newer; "
-        f"this is {sys.version.split()[0]}.\n"
+        f"perplexity-agent-mcp requires Python 3.10 or newer; this is {sys.version.split()[0]}.\n"
     )
     raise SystemExit(1)
 
@@ -60,7 +63,7 @@ WAIT_SECONDS_DEFAULT = 55
 
 
 def main() -> int:
-    """Entry point. Implemented in Task 6."""
+    """Entry point. Implemented in Task 5."""
     raise NotImplementedError
 
 
