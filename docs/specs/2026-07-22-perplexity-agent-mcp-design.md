@@ -90,6 +90,53 @@ Sources: [agent-post](https://docs.perplexity.ai/api-reference/agent-post),
 [background mode](https://docs.perplexity.ai/docs/agent-api/background-mode),
 [OpenAI compatibility](https://docs.perplexity.ai/docs/agent-api/openai-compatibility).
 
+### 3.3 MCP client tool-call timeouts — the constraint that shapes the tool surface
+
+Researched 2026-07-22. **No MCP client publishes this; the Claude Desktop figure
+was obtained by reverse-engineering the installed app (v1.24012.1).**
+
+| Client | Tool-call timeout | User-configurable? | Sends `progressToken`? |
+|---|---|---|---|
+| **Claude Desktop** | **60 s** | **No** — no config field, no env var | **Never** |
+| Claude Code (stdio) | ~28 h wall-clock, 30 min idle | Yes (`MCP_TOOL_TIMEOUT`, per-server `timeout`, idle var) | Yes — and **auto-backgrounds any call past 2 min** |
+| Cursor (ACP/CLI) | 60 s | No | — |
+| Cursor (IDE) | ~60 min (staff forum post, unverified) | No | — |
+| VS Code / Copilot | **None** — waits indefinitely | n/a | Yes; renders status in the UI |
+| MCP TypeScript SDK | 60 s | Per-request | Only if the integrator opts in |
+| MCP Python SDK | None | Yes | No reset-on-progress implemented |
+
+Claude Desktop bundles the TS SDK (`DEFAULT_REQUEST_TIMEOUT_MSEC = 60_000`) and
+calls `callTool()` with no options, falling through to the default.
+
+**Consequence: a synchronous tool call longer than ~60 s is dead on arrival on the
+brief's own primary target client**, while the run keeps billing server-side after
+the client has given up.
+
+**Progress notifications do not rescue this.** The spec says clients *MAY* reset
+the timeout on progress ("Implementations **MAY** choose to reset the timeout
+clock… However, implementations **SHOULD** always enforce a maximum timeout"),
+both SDKs default to not resetting, and a server may only send progress if the
+client supplied a `progressToken` — which Claude Desktop never does. Progress is
+opportunistic upside, not a mitigation.
+
+Sources: [lifecycle §Timeouts](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
+[progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress),
+[Claude Code env vars](https://code.claude.com/docs/en/env-vars).
+
+### 3.4 Empirically verified — Perplexity background-mode behaviour
+
+Three questions the docs do not answer. Settled on 2026-07-22 by two live
+`medium`-preset runs (raw timeline in §3.4 table; probe cost $0.039 per run).
+
+| Question | Verified answer |
+|---|---|
+| Is `output` populated mid-run? | **Yes.** At 5 s: 3 `search_results` items. At 7.5 s: 3 `search_results` + 3 `fetch_url_results`. The `message` item appears only on completion. **Undocumented; this is what makes a status tool worth having.** |
+| Is `usage` populated mid-run? | **No.** Absent until `status: completed`. No mid-run cost visibility. |
+| Does cancelling reduce the bill? | **Unknowable.** A cancelled run reports **no `usage` and no `cost` at all**, even once terminal. We cannot distinguish "not billed" from "billed but not reported", and the docs are silent. **We must not claim cancellation saves money.** |
+| How slow is `medium` really? | **12.5 s** for a three-source comparison query. Far faster than assumed. One sample — do not over-fit — but the sync path will cover `fast`/`low`/`medium` in the common case. |
+| Cancel semantics | `POST /cancel` → 200 `{status: "cancelling"}`, terminal `cancelled` within ~3 s. Re-cancelling a terminal run → **400**. Matches docs. |
+| SSE replay on a non-streamed run | Inconclusive (non-JSON response). Not used by this design. |
+
 ## 4. Decisions
 
 Each decision records its rationale so it is not silently reversed later.
@@ -100,8 +147,13 @@ Each decision records its rationale so it is not silently reversed later.
 | D2 | **Target MCP `2025-11-25`**, flat dispatch dict | Every shipping client speaks it today. `2026-07-28` lands in 6 days but clients need their own dual-era support first, and stdio framing is unchanged — so `server/discover` is a later additive change, not a rewrite. |
 | D3 | **Python floor 3.10**, develop and gate on 3.14 | The client config invokes bare `python3`; stock macOS `python3` is 3.9.6. Nothing here needs modern syntax. 3.9 is EOL and documenting an EOL floor on a security repo looks bad. Matrix proves the floor is real. |
 | D4 | **stdlib `unittest`, fake upstream via `http.server`** | `git clone && python3 -m unittest` with nothing installed. The zero-supply-chain claim then holds for contributors too, not just users. |
-| D5 | **Background + poll, bounded deadline** | One code path for every preset. Each HTTP call is short, so a network blip cannot kill a 5-minute run. The deep presets are the entire reason this project exists. |
+| D5 | **Background + poll** upstream, always | One code path for every preset. Each HTTP call is short, so a network blip cannot kill a long run. The deep presets are the entire reason this project exists. |
 | D6 | **Params: `query`, `preset`, `recency`, `domains`** | `model` dropped: `anthropic/*` 400s without `max_output_tokens`, and IDs drift. Recency and domain filters are what separate research from search, and cost ~6 lines since both live in the same nested dict. |
+| D11 | **Three tools, not one** — `perplexity_agent`, `_result`, `_cancel` | §3.3: a >60 s synchronous call is broken on Claude Desktop and unfixable by the user. Callers must be able to start work, do something else, and collect later. The brief's "one tool" was a proxy for "don't sprawl"; submit/poll/cancel is one coherent lifecycle, not three features. Claude Code's own auto-backgrounding is the same pattern, arrived at independently. |
+| D12 | **`wait=true` default, 55 s budget**, overridable to 300 s | Tuned to the tightest real client so the out-of-box config works everywhere. §3.4 shows `medium` finishing in ~12 s, so the common case stays a single call. `PERPLEXITY_AGENT_WAIT_SECONDS=300` is the documented setting for Claude Code / VS Code / Cursor IDE. |
+| D13 | **Deadline hands back an id; never cancels** | Reverses an earlier draft. Cancel-on-timeout destroys work already paid for. A blown budget must degrade into the async path, never into nothing. |
+| D14 | **Opportunistic `notifications/progress`** | Only when the request carries a `progressToken`. Resets Claude Code's idle timer, shows live status in VS Code, no-op elsewhere. ~10 lines, pure upside, no behaviour depends on it. |
+| D15 | **Never claim cancellation saves money** | §3.4: cancelled runs report no `usage` and no `cost`, and the docs are silent. The tool says it stops the run and says nothing about billing. |
 | D7 | **Full CI gate set**, Actions pinned to SHAs | The core claim ("zero dependencies") is mechanically enforceable, so it must be enforced. Tag-pinned Actions are a live supply-chain hole. |
 | D8 | **`flit_core` build backend** | Empirically resolves to 1 package with zero transitive deps (`hatchling` pulls 5, `setuptools` is megabytes). With `dynamic = ["version", "description"]` it reads both from the module itself — single source of truth, no drift. |
 | D9 | **Spotlighting via randomized delimiter** | Published technique (Microsoft Research, [arXiv:2403.14720](https://arxiv.org/pdf/2403.14720)). A *fixed* tag has an obvious break-out attack; a per-response nonce structurally prevents it. |
@@ -135,28 +187,40 @@ module docstring            ← flit reads this as the package description
 __version__                 ← flit reads this as the package version
 Python version guard        ← clear message, not a SyntaxError
 stdout capture + rebind     ← see §9.2
-constants (API URLs, protocol versions, timeouts, TOOL schema)
+constants (API URLs, protocol versions, wait budget, TOOLS schema)
 _request()                  ← the network choke point
-run_agent()
-_extract_answer() / _extract_sources()
-_format_result()            ← spotlighting wrapper
+_submit() / _poll() / _cancel()
+_extract_answer() / _extract_sources() / _progress_summary()
+_spotlight()                ← untrusted-content wrapper
+tool_agent() / tool_result() / tool_cancel()
+TOOLS = {...}               ← name → (schema, implementation)
 handle_initialize() / handle_tools_list() / handle_tools_call() / handle_ping()
 HANDLERS = {...}
 dispatch()
 main()
 ```
 
-## 6. The tool
+Target revised to ~330 lines: three tools and the shared poll loop cost roughly
+70 lines over the single-tool draft. Still one screen per band, still auditable in
+one sitting.
 
-- **name:** `perplexity_agent`
+## 6. The tools
+
+Three tools forming one lifecycle: **start → collect → abandon** (D11).
+
+No `outputSchema` is declared on any of them. Declaring one creates a hard MUST
+obligation to always conform, and Perplexity returns free-form prose.
+
+### 6.1 `perplexity_agent` — start a research run
+
 - **title:** `Perplexity Agent Research`
 - **annotations:** `{"readOnlyHint": true, "openWorldHint": true}`
   (defaults are pessimistic; silence means clients must assume destructive)
 - **description:** Run a research query through Perplexity's Agent API (multi-step
   web research with citations). Use for deep or multi-hop questions where a single
-  synthesized, sourced answer is wanted.
-
-### `inputSchema`
+  synthesized, sourced answer is wanted. With `wait: true` (default) this blocks
+  until the answer is ready or the wait budget expires; if the budget expires it
+  returns a `response_id` to collect later with `perplexity_agent_result`.
 
 ```json
 {
@@ -169,7 +233,9 @@ main()
     "recency": {"type": "string", "enum": ["hour","day","week","month","year"],
                 "description": "Restrict sources to those published within this window."},
     "domains": {"type": "array", "items": {"type": "string"}, "maxItems": 20,
-                "description": "Restrict sources to these domains. Prefix with '-' to exclude. Allowlist or denylist, not both."}
+                "description": "Restrict sources to these domains. Prefix with '-' to exclude. Allowlist or denylist, not both."},
+    "wait":    {"type": "boolean", "default": true,
+                "description": "Block until the answer is ready. Set false to return a response_id immediately and collect the result later — useful for running several deep queries in parallel while doing other work."}
   },
   "required": ["query"],
   "additionalProperties": false
@@ -180,8 +246,64 @@ main()
 `wide-research` already broke the brief's guessed list. Client-side allowlisting
 would reject valid future presets. It is passed through and upstream validates.
 
-No `outputSchema` is declared. Declaring one creates a hard MUST obligation to
-always conform, and Perplexity returns free-form prose. Not worth the constraint.
+### 6.2 `perplexity_agent_result` — collect a run
+
+- **annotations:** `{"readOnlyHint": true, "openWorldHint": true}`
+- **description:** Retrieve the result of a research run started by
+  `perplexity_agent`. If it is still running, reports what it has done so far and
+  how long to wait before checking again.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "response_id":  {"type": "string",
+                     "description": "The response_id returned by perplexity_agent."},
+    "wait_seconds": {"type": "integer", "minimum": 0, "default": 0,
+                     "description": "Block up to this many seconds waiting for completion. 0 checks once and returns immediately. Capped at the server's wait budget."}
+  },
+  "required": ["response_id"],
+  "additionalProperties": false
+}
+```
+
+`wait_seconds` exists because **most agents have no sleep primitive.** Told to
+"check again in 30 seconds", a caller can only burn a turn or poll immediately and
+waste tokens. A bounded server-side block is the humane option, and it reuses the
+same poll loop as §6.1 for free.
+
+**Not-ready is `isError: false`.** It is a legitimate state, not a failure;
+flagging it as an error invites the caller to retry the whole research run.
+
+Progress reporting exploits §3.4: mid-run `output` items are counted and
+summarised — e.g. *"still running (18s): 3 searches run, 3 pages fetched, not yet
+synthesizing"*. Where no partial items exist yet, it degrades to the bare status.
+
+### 6.3 `perplexity_agent_cancel` — abandon a run
+
+- **annotations:** `{"readOnlyHint": false, "destructiveHint": true,
+  "idempotentHint": false, "openWorldHint": true}`
+  — honest: it terminates work, and a second call on a terminal run returns 400.
+- **description:** Stop a research run started with `wait: false` that is no longer
+  needed. Perplexity does not report usage for cancelled runs, so this tool
+  **cannot** tell you whether it reduced your bill (D15).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "response_id": {"type": "string",
+                    "description": "The response_id returned by perplexity_agent."}
+  },
+  "required": ["response_id"],
+  "additionalProperties": false
+}
+```
+
+This tool exists because async creates a cost leak by design: Perplexity's docs
+confirm *"The run continues server-side even if your client disconnects."* An
+abandoned run completes and bills regardless. Offering async without offering
+cancellation would be irresponsible.
 
 ## 7. Request construction
 
@@ -209,28 +331,62 @@ background mode requires (see §9.5).
 
 ## 8. Execution flow
 
+Every tool call begins the same way: validate arguments (`isError: true` on bad
+input, **not** `-32602`), then resolve the API key from the environment
+(`isError: true` if unset or empty).
+
+### 8.1 `perplexity_agent`
+
 ```
-tools/call
-  → validate arguments               → isError: true on bad input (NOT -32602)
-  → resolve API key from env         → isError: true if unset/empty
-  → POST /v1/agent  (background: true)  → returns id, status "queued"
-  → poll GET /v1/agent/{id}
-       interval 2s, backing off to 5s
-       until status ∈ {completed, failed, incomplete, cancelled} or deadline
-  → on deadline: best-effort POST /v1/agent/{id}/cancel, then isError
-  → parse → spotlighting wrapper → text content block
+POST /v1/agent  {background: true, …}   → id, status "queued"
+if not wait:  return id + the exact follow-up call to make
+else:         _poll(id, budget = WAIT_SECONDS)
+                ├─ terminal  → parse → spotlight → answer
+                └─ budget up → return id + progress so far + follow-up call
+                               (NEVER cancel — D13)
 ```
 
-**Timeouts.** Overall deadline 240 s, overridable via
-`PERPLEXITY_AGENT_TIMEOUT_SECONDS`. Per-request socket timeout 30 s — each
-individual call is short, which is the structural win of polling over one
-long-held socket.
+### 8.2 `perplexity_agent_result`
+
+```
+validate response_id against ^[A-Za-z0-9_-]{1,128}$   (§9.3)
+_poll(id, budget = min(wait_seconds, WAIT_SECONDS))
+  ├─ terminal  → parse → spotlight → answer
+  └─ budget up → isError:false + status + progress summary + suggested delay
+```
+
+### 8.3 `perplexity_agent_cancel`
+
+```
+validate response_id
+POST /v1/agent/{id}/cancel
+  ├─ 200 → "cancellation requested" (says nothing about billing — D15)
+  ├─ 400 → "already finished or already cancelled"  (isError: false — benign)
+  └─ 404 → "unknown response_id"                    (isError: true)
+```
+
+### 8.4 The shared poll loop
+
+`_poll(id, budget)` is the one piece of timing logic in the file, used by all
+three paths above. Interval 2 s, backing off to 5 s; terminal set is
+`{completed, failed, incomplete, cancelled}`. On each iteration it emits a
+`notifications/progress` **only if** the originating request carried a
+`progressToken` (D14).
+
+**Timeouts.** Wait budget `PERPLEXITY_AGENT_WAIT_SECONDS`, **default 55 s** —
+just inside Claude Desktop's unconfigurable 60 s ceiling (§3.3). The README
+documents `=300` as the recommended setting for Claude Code, VS Code and Cursor
+IDE. Per-request socket timeout 30 s: each individual HTTP call is short, which is
+the structural win of polling over one long-held socket.
 
 **Retry.** On 429 / 5xx / network error only: 3 attempts, exponential backoff with
 jitter (their docs prescribe this; no `Retry-After` header exists). 4xx is never
 retried — a bad request retried is just a slower bad request.
 
-**Cancel on deadline** stops billing for research nobody will read.
+**Progress summary.** Built from mid-run `output` items (§3.4): counts of
+`search_results` and `fetch_url_results` entries seen so far, plus elapsed time.
+Never includes source content — only counts — so a partial-progress report cannot
+itself carry a prompt injection.
 
 ## 9. Security design
 
@@ -321,10 +477,13 @@ Answer and source list are truncated to a documented cap so a runaway
 |---|---|
 | Unknown method | `-32601` |
 | Unknown tool name, malformed `params` | `-32602` |
-| **Bad argument value** (empty query, bad recency) | **`isError: true`** |
+| **Bad argument value** (empty query, bad recency, malformed `response_id`) | **`isError: true`** |
 | Missing / empty `PERPLEXITY_API_KEY` | `isError: true` |
 | Perplexity 401 / 429 / 400, timeout, network failure | `isError: true` |
 | `status: "failed"` | `isError: true`, surfacing upstream `error.message` |
+| **Run still in progress** (`_result`, or `_agent` budget expired) | **`isError: false`** — a legitimate state. Returns id, progress summary, suggested delay. Marking it an error invites the caller to restart the whole run. |
+| Cancel on an already-terminal run (upstream 400) | **`isError: false`** — the goal state is already achieved; this is benign, not a failure |
+| Cancel with an unknown / foreign id (upstream 404) | `isError: true` |
 | `status: "incomplete"` | Partial answer **plus an explicit note** — half an answer silently presented as whole is the worst outcome |
 | Unhandled exception in tool body | `isError: true` |
 | Unhandled exception in dispatcher | `-32603` |
@@ -342,9 +501,10 @@ surfaced, but never headers and never a raw traceback.
 
 | File | Covers |
 |---|---|
-| `tests/fake_perplexity.py` | stdlib `http.server` double: completed / failed / incomplete / slow responses, 401, 429, 5xx, malformed JSON, unknown-field envelope |
-| `tests/test_mcp_protocol.py` | Drives the real server as a subprocess over real pipes. Every row of §10. Version negotiation. Notifications get no reply. EOF exits 0. |
-| `tests/test_perplexity_client.py` | Request body shape, filter nesting, polling loop, deadline + cancel, retry/backoff, answer reconstruction, source dedupe, tolerant parsing |
+| `tests/fake_perplexity.py` | stdlib `http.server` double: completed / failed / incomplete / slow responses, **scripted `queued` → `in_progress` (partial `output`) → `completed` transitions** per §3.4, 401, 429, 5xx, malformed JSON, unknown-field envelope, cancel returning 200 / 400 / 404 |
+| `tests/test_mcp_protocol.py` | Drives the real server as a subprocess over real pipes. Every row of §10. Version negotiation. Notifications get no reply. EOF exits 0. All three tools listed with correct annotations. |
+| `tests/test_perplexity_client.py` | Request body shape, filter nesting, poll loop, retry/backoff, answer reconstruction, source dedupe, tolerant parsing |
+| `tests/test_async_lifecycle.py` | `wait=false` returns an id immediately; `wait=true` budget expiry returns id + progress and **does not cancel** (D13); `_result` on an in-progress run is `isError: false` with a progress summary; `_result` `wait_seconds` blocks then returns; `_cancel` 400 is benign and 404 is an error; progress summaries contain counts only, never source text |
 | `tests/test_spotlighting.py` | Wrapper structure, nonce randomness, closing-tag strip, answer-inside-wrapper |
 | `tests/test_no_dependencies.py` | AST walk asserting every import resolves to a stdlib allowlist; `pyproject.toml` `dependencies == []` (skipped on 3.10, which lacks `tomllib`) |
 | `tests/test_no_secrets.py` | Key never appears in stdout, stderr, or any error message; no `pplx-` pattern anywhere in the tree |
@@ -358,7 +518,7 @@ via an environment variable (§9.3). The shipped file has no redirect path at al
 ```
 perplexity_agent_mcp.py       ← the only file a user needs
 pyproject.toml                ← flit_core; [tool.*] config; dependencies = []
-tests/                        ← 7 files above
+tests/                        ← 8 files above
 docs/specs/                   ← this document
 .github/workflows/ci.yml
 .github/dependabot.yml        ← Actions only; nothing else to bump
@@ -466,8 +626,11 @@ failure mode it prevents: a future agent helpfully adding `requests`, or
 
 1. `PERPLEXITY_API_KEY=… python3 perplexity_agent_mcp.py` starts and blocks on stdin.
 2. The README self-test recipe drives `initialize` → `notifications/initialized` →
-   `tools/list` → `tools/call` and shows a valid initialize result, the
-   `perplexity_agent` tool, and real answer text plus at least one source URL.
+   `tools/list` → `tools/call` and shows a valid initialize result, all three
+   tools, and real answer text plus at least one source URL.
+2b. A `wait: false` call returns a `response_id` in under two seconds;
+   `perplexity_agent_result` on it reports progress while running and the full
+   answer once complete; `perplexity_agent_cancel` terminates a running job.
 3. Missing / empty `PERPLEXITY_API_KEY` → clean tool error, no traceback, no leak.
 4. A non-2xx from Perplexity → readable error content; server stays alive.
 5. `grep` shows no third-party imports; the key never reaches stdout or any log.
@@ -479,8 +642,17 @@ failure mode it prevents: a future agent helpfully adding `requests`, or
 ## 16. Follow-ons (explicitly out of scope for v0.1.0)
 
 - `server/discover` + stateless `_meta` handling for MCP `2026-07-28`.
-- A `perplexity_agent_result(response_id)` tool to retrieve runs that exceeded the
-  deadline, making `xhigh` / `wide-research` usable across two calls.
+- **MCP Tasks extension** (`2025-11-25`, experimental): the spec-blessed async
+  pattern — a task-augmented `tools/call` returns `CreateTaskResult` with
+  `taskId` / `ttl` / `pollInterval`, and the client polls `tasks/get`. VS Code
+  already implements the client half. Declaring `execution.taskSupport:
+  "optional"` would give Tasks-aware clients a native experience while our own
+  three-tool lifecycle continues to serve everyone else. Deferred because it is
+  experimental and Claude Desktop does not support it.
+- SSE progress via `GET /v1/agent/{id}?stream=true&starting_after=N`, which
+  carries `response.reasoning.search_results` events. Deferred: undocumented in
+  the OpenAPI spec, undocumented expiry window, and §3.4 could not confirm it
+  works on a run not created with `stream: true`.
 - `structuredContent` alongside the text block.
 - PyPI publication.
 - Exposing `instructions` (system prompt) or `finance_search` / `people_search`.
