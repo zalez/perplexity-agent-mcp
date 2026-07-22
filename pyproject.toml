@@ -1,0 +1,62 @@
+# Packaging is OPTIONAL. Users may simply download perplexity_agent_mcp.py and
+# run it with python3; this file exists so `uvx --from git+... ` also works.
+# flit_core is used because it resolves to exactly one package with zero
+# transitive dependencies (hatchling pulls five), and because it reads the
+# version and description straight out of the module — so they cannot drift.
+
+[build-system]
+requires = ["flit_core>=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "perplexity-agent-mcp"
+requires-python = ">=3.10"
+dependencies = []
+dynamic = ["version", "description"]
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Constantin Gonzalez", email = "constantin@glez.de" }]
+keywords = ["mcp", "perplexity", "model-context-protocol", "research"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/zalez/perplexity-agent-mcp"
+Issues = "https://github.com/zalez/perplexity-agent-mcp/issues"
+
+[project.scripts]
+perplexity-agent-mcp = "perplexity_agent_mcp:main"
+
+[tool.flit.module]
+name = "perplexity_agent_mcp"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "S", "RUF", "ANN"]
+# ANN401: we annotate `object` rather than `Any` throughout, so the few places
+# a truly dynamic type is unavoidable would otherwise need a per-line noqa.
+# S310 (urllib with a non-literal URL) and S311 (non-crypto random, used only
+# for retry jitter) are suppressed at their single call sites with noqa, so a
+# reviewer sees the justification next to the code rather than in this file.
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "ANN"]  # asserts and loose annotations are fine in tests
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
