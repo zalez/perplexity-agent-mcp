@@ -26,6 +26,24 @@ class ClientTestCase(unittest.TestCase):
         self.fake.close()
 
 
+class AuthedClientTestCase(ClientTestCase):
+    """Base: fake upstream plus a fake API key already in the environment.
+
+    Holds `setUp` only, deliberately no `test_*` methods of its own — unittest
+    has no notion of "inherit setUp but not the tests," so subclassing a
+    concrete `TestCase` re-runs that class's own tests too. `TestRequest`,
+    `TestSubmit`, `TestPoll`, and `TestCancel` are siblings that each inherit
+    straight from this class rather than from one another, precisely so none
+    of them replays another's tests.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._env = unittest.mock.patch.dict("os.environ", {"PERPLEXITY_API_KEY": "pplx-test-key"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+
 class TestApiKey(ClientTestCase):
     def test_missing_key_raises_clean_error(self) -> None:
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
@@ -39,13 +57,7 @@ class TestApiKey(ClientTestCase):
                 srv._api_key()
 
 
-class TestRequest(ClientTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self._env = unittest.mock.patch.dict("os.environ", {"PERPLEXITY_API_KEY": "pplx-test-key"})
-        self._env.start()
-        self.addCleanup(self._env.stop)
-
+class TestRequest(AuthedClientTestCase):
     def test_post_sends_body_and_returns_parsed_json(self) -> None:
         self.fake.script((200, {"id": "resp_1", "status": "queued"}))
         result = srv._request("POST", "/v1/agent", {"input": "hello"})
@@ -69,10 +81,20 @@ class TestRequest(ClientTestCase):
 
     def test_key_never_appears_in_exception(self) -> None:
         self.fake.script((500, {"error": {"message": "boom"}}))
-        with self.assertRaises(srv.PerplexityError) as ctx:
-            srv._request("GET", "/v1/agent/resp_1")
+        # Backoff is mocked so this test doesn't sleep for real; the retry
+        # loop itself still runs, so prove it did rather than just assuming.
+        with unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep:
+            with self.assertRaises(srv.PerplexityError) as ctx:
+                srv._request("GET", "/v1/agent/resp_1")
         self.assertNotIn("pplx-test-key", str(ctx.exception))
         self.assertNotIn("pplx-test-key", ctx.exception.message)
+        self.assertEqual(len(self.fake.requests), 3, "all 3 attempts must reach the upstream")
+        self.assertEqual(mock_sleep.call_count, 2, "two backoffs between three attempts")
+        first_delay = mock_sleep.call_args_list[0].args[0]
+        second_delay = mock_sleep.call_args_list[1].args[0]
+        self.assertTrue(1.0 <= first_delay < 2.0, "attempt 0 backoff must be 2**0 + jitter")
+        self.assertTrue(2.0 <= second_delay < 3.0, "attempt 1 backoff must be 2**1 + jitter")
+        self.assertLess(first_delay, second_delay, "backoff must increase between attempts")
 
     def test_network_error_message_never_leaks_key(self) -> None:
         """Worst case for the redaction in `_request`: the transport-level
@@ -88,20 +110,39 @@ class TestRequest(ClientTestCase):
         the one the redaction comment is actually about.
         """
         poisoned = OSError("reset while sending 'Authorization: Bearer pplx-test-key'")
-        with unittest.mock.patch("urllib.request.urlopen", side_effect=poisoned):
+        with (
+            unittest.mock.patch("urllib.request.urlopen", side_effect=poisoned) as mock_urlopen,
+            unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep,
+        ):
             with self.assertRaises(srv.PerplexityError) as ctx:
                 srv._request("GET", "/v1/agent/resp_1")
         self.assertNotIn("pplx-test-key", str(ctx.exception))
         self.assertNotIn("pplx-test-key", ctx.exception.message)
         self.assertIn("OSError", ctx.exception.message)
+        # urlopen is itself the mock here, so there is no upstream request to
+        # count; retry is proven by how many times urlopen was invoked instead.
+        self.assertEqual(mock_urlopen.call_count, 3, "all 3 attempts must be made")
+        self.assertEqual(mock_sleep.call_count, 2, "two backoffs between three attempts")
+        first_delay = mock_sleep.call_args_list[0].args[0]
+        second_delay = mock_sleep.call_args_list[1].args[0]
+        self.assertTrue(1.0 <= first_delay < 2.0, "attempt 0 backoff must be 2**0 + jitter")
+        self.assertTrue(2.0 <= second_delay < 3.0, "attempt 1 backoff must be 2**1 + jitter")
+        self.assertLess(first_delay, second_delay, "backoff must increase between attempts")
 
     def test_retries_5xx_then_succeeds(self) -> None:
         self.fake.script(
             (500, {"error": {"message": "transient"}}),
             (200, {"id": "resp_2", "status": "queued"}),
         )
-        result = srv._request("POST", "/v1/agent", {"input": "x"})
+        with unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep:
+            result = srv._request("POST", "/v1/agent", {"input": "x"})
         self.assertEqual(result["id"], "resp_2")
+        # Prove the second response was reached via an actual retry, not e.g.
+        # the fake happening to serve the success response first.
+        self.assertEqual(len(self.fake.requests), 2, "must retry once after the 500")
+        self.assertEqual(mock_sleep.call_count, 1, "exactly one backoff before the retry")
+        delay = mock_sleep.call_args_list[0].args[0]
+        self.assertTrue(1.0 <= delay < 2.0, "attempt 0 backoff must be 2**0 + jitter")
 
     def test_does_not_retry_4xx(self) -> None:
         self.fake.script((400, {"error": {"message": "bad request"}}))
@@ -380,7 +421,7 @@ RUNNING: dict[str, object] = {
 }
 
 
-class TestSubmit(TestRequest):
+class TestSubmit(AuthedClientTestCase):
     def test_submit_sends_background_true_and_the_preset(self) -> None:
         self.fake.script((200, {"id": "resp_x", "status": "queued"}))
         response_id = srv._submit("why?", "medium", None, None)
@@ -413,7 +454,7 @@ class TestSubmit(TestRequest):
             srv._submit("why?", "medium", None, None)
 
 
-class TestPoll(TestRequest):
+class TestPoll(AuthedClientTestCase):
     def test_returns_immediately_when_already_terminal(self) -> None:
         self.fake.script((200, COMPLETED))
         payload, terminal = srv._poll("resp_x", budget=10)
@@ -422,12 +463,25 @@ class TestPoll(TestRequest):
 
     def test_polls_until_terminal(self) -> None:
         self.fake.script((200, QUEUED), (200, RUNNING), (200, COMPLETED))
-        _payload, terminal = srv._poll("resp_x", budget=30)
+        # budget=30 is far bigger than either sleep, so the poll INTERVAL
+        # governs the runtime here, not the budget - patch it out so this
+        # test doesn't spend several real seconds proving something the
+        # budget-expiry test below already covers a different way.
+        with unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep:
+            _payload, terminal = srv._poll("resp_x", budget=30)
         self.assertTrue(terminal)
         self.assertGreaterEqual(len(self.fake.requests), 3)
+        # No jitter in _poll's own backoff (unlike _request's retry backoff),
+        # so the schedule is exactly checkable: 2.0s, then x1.5 -> 3.0s.
+        self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [2.0, 3.0])
 
     def test_gives_up_at_the_budget_without_cancelling(self) -> None:
-        """A blown budget must hand back recoverable state, never destroy it."""
+        """A blown budget must hand back recoverable state, never destroy it.
+
+        Real timing, deliberately not mocked: budget=0.1 makes elapsed-time
+        behaviour itself the thing under test, so faking the clock here would
+        stop this test from testing anything.
+        """
         self.fake.script((200, RUNNING))
         payload, terminal = srv._poll("resp_x", budget=0.1)
         self.assertFalse(terminal)
@@ -438,16 +492,20 @@ class TestPoll(TestRequest):
     def test_invokes_the_progress_callback_when_supplied(self) -> None:
         self.fake.script((200, RUNNING), (200, COMPLETED))
         seen: list[str] = []
-        srv._poll("resp_x", budget=30, notify=seen.append)
+        # Same reasoning as test_polls_until_terminal: budget=30 means the
+        # interval, not the budget, governs, so patch it out.
+        with unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep:
+            srv._poll("resp_x", budget=30, notify=seen.append)
         self.assertTrue(seen)
         self.assertIn("status", seen[0])
+        self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [2.0])
 
     def test_rejects_a_malformed_response_id(self) -> None:
         with self.assertRaises(srv.PerplexityError):
             srv._poll("../../etc/passwd", budget=1)
 
 
-class TestCancel(TestRequest):
+class TestCancel(AuthedClientTestCase):
     def test_cancel_posts_to_the_cancel_path(self) -> None:
         self.fake.script((200, {"response_id": "resp_x", "status": "cancelling"}))
         message = srv._cancel("resp_x")

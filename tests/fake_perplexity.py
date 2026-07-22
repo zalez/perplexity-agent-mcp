@@ -52,7 +52,16 @@ class FakePerplexity:
                 pass  # keep the test output clean
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # serve_forever()'s default poll_interval is 0.5s: it polls the socket
+        # with that timeout and only checks for a pending shutdown() request
+        # between polls. With every test in the suite spinning up and tearing
+        # down one of these, that default turns close() into a ~0.5s wait,
+        # nearly every time - a fixed tax on every test, unrelated to what any
+        # of them actually verify. A short interval keeps shutdown() responsive
+        # without changing anything about what gets served.
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self._thread.start()
 
     def _next(self) -> tuple[int, dict[str, Any]]:
