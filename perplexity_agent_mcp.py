@@ -241,6 +241,32 @@ def _safe_json(raw: bytes) -> dict[str, object]:
 # context window.
 _MAX_ANSWER_CHARS = 60_000
 _MAX_SOURCES = 50
+# Completes the bound above: without a per-title cap, up to _MAX_SOURCES
+# titles of unbounded length (limited only by the 32 MiB HTTP response cap,
+# _MAX_RESPONSE_BYTES) could still blow up the rendered payload. Real
+# citation titles are short prose; this only ever fires on a pathological or
+# hostile one.
+_MAX_TITLE_CHARS = 300
+# Same protection, applied to the URL, at a longer ceiling. Real-world URLs
+# (query strings, redirect chains, tracking tokens) legitimately run longer
+# than titles, and a truncated URL is not merely an abbreviated caption — it
+# is a broken citation. 2000 chars comfortably covers genuine citations
+# (browsers themselves balk at URLs well beyond this) while still bounding
+# the pathological case, the same way the title cap does.
+_MAX_URL_CHARS = 2000
+# `status` is Perplexity's own orchestration word ("queued", "completed", …),
+# not retrieved web content (see `_progress_summary`) — but it is still
+# echoed into client-facing text, so it gets the same defensive bound.
+_MAX_STATUS_CHARS = 100
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters, marking a real cut with an
+    ellipsis so a chopped string can never quietly pass as the complete one.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _items(payload: dict[str, object], kind: str) -> list[dict[str, object]]:
@@ -291,9 +317,15 @@ def _extract_sources(payload: dict[str, object]) -> list[dict[str, str]]:
             url = result.get("url")
             if not isinstance(url, str) or url in seen:
                 continue
-            seen.add(url)
+            seen.add(url)  # dedup on the FULL url, before any truncation below
             title = result.get("title")
-            sources.append({"url": url, "title": title if isinstance(title, str) else url})
+            title_text = title if isinstance(title, str) else url
+            sources.append(
+                {
+                    "url": _truncate(url, _MAX_URL_CHARS),
+                    "title": _truncate(title_text, _MAX_TITLE_CHARS),
+                }
+            )
             if len(sources) >= _MAX_SOURCES:
                 return sources
     return sources
@@ -303,8 +335,12 @@ def _progress_summary(payload: dict[str, object], elapsed: float) -> str:
     """Describe an in-flight run.
 
     Mid-run `output` really is populated — verified empirically, undocumented.
-    We report COUNTS ONLY and never any retrieved text: a progress report that
-    echoed page content would be a second prompt-injection surface.
+    We report COUNTS of search results and fetched pages, and never any
+    retrieved text: a progress report that echoed page content would be a
+    second prompt-injection surface. The one exception is `status` itself —
+    Perplexity's own orchestration word ("queued", "in_progress", …), not
+    attacker-retrieved content, so it sits outside that threat model. It is
+    still echoed length-bounded, defensively.
     """
     searches = 0
     for item in _items(payload, "search_results"):
@@ -313,7 +349,7 @@ def _progress_summary(payload: dict[str, object], elapsed: float) -> str:
             searches += len(results)
     fetches = len(_items(payload, "fetch_url_results"))
     status = payload.get("status")
-    status_text = status if isinstance(status, str) else "unknown"
+    status_text = _truncate(status, _MAX_STATUS_CHARS) if isinstance(status, str) else "unknown"
     bits = [f"status {status_text} after {elapsed:.0f}s"]
     if searches:
         bits.append(f"{searches} search result(s) gathered")
@@ -335,7 +371,11 @@ def _spotlight(body: str) -> str:
     This is a MITIGATION, NOT A FIX. No client is obliged to honour the
     delimiter and no model is guaranteed to respect it. See SECURITY.md.
     """
-    nonce = secrets.token_hex(4)
+    # 8 bytes (64 bits) of entropy. A blind guess made before this nonce is
+    # drawn has no oracle to test against, so 32 bits was already adequate
+    # for this threat model — but 64 bits is free and removes the question
+    # entirely from a public security review.
+    nonce = secrets.token_hex(8)
     close = f"</untrusted-web-content-{nonce}>"
     # Belt and braces: strip the (unguessable) closing tag if it somehow appears.
     safe = body.replace(close, "[removed]")
