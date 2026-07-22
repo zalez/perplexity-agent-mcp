@@ -510,7 +510,13 @@ def _wait_budget() -> int:
     return WAIT_SECONDS_DEFAULT
 
 
-def _submit(query: str, preset: str, recency: str | None, domains: list[str] | None) -> str:
+def _submit(
+    query: str,
+    preset: str,
+    recency: str | None,
+    domains: list[str] | None,
+    deadline: float | None = None,
+) -> str:
     """Start a run in background mode and return its id.
 
     Always `background: true`, for every preset. One code path, and each HTTP
@@ -520,6 +526,14 @@ def _submit(query: str, preset: str, recency: str | None, domains: list[str] | N
     `model` is deliberately never sent: anthropic/* models reject requests that
     omit max_output_tokens, and model ids drift. The preset selects the model
     and tracks Perplexity's own updates.
+
+    `deadline` is forwarded straight to `_request`, for the same reason
+    `_poll` already accepts one: a tool call must be bounded END TO END, not
+    just its poll phase. Without it, this call's own retry loop can burn up
+    to roughly 90s on its own (see `_request`'s docstring) BEFORE a
+    subsequent `_poll` even starts — silently doubling a 55s wait budget
+    into a ~145s worst case. Defaults to None so every pre-existing caller
+    is unaffected — see `_request`'s own `deadline is None` guarantee.
     """
     web_search: dict[str, object] = {"type": "web_search"}
     filters: dict[str, object] = {}
@@ -541,6 +555,7 @@ def _submit(query: str, preset: str, recency: str | None, domains: list[str] | N
             "background": True,
             "tools": [web_search],
         },
+        deadline=deadline,
     )
     response_id = payload.get("id")
     if not isinstance(response_id, str) or not response_id:
@@ -584,15 +599,20 @@ def _poll(
         interval = min(interval * 1.5, _POLL_INTERVAL_MAX)
 
 
-def _cancel(response_id: str) -> str:
+def _cancel(response_id: str, deadline: float | None = None) -> str:
     """Ask Perplexity to stop a run.
 
     Says nothing about billing, and must never be changed to. Cancelled runs
     report no `usage` and no `cost` at all, so "not billed" and "billed but not
     reported" are indistinguishable from the outside, and the docs are silent.
+
+    `deadline` is forwarded to `_request` for the same reason `_submit` now
+    accepts one: a tool call must be bounded end to end, not just its poll
+    phase. Defaults to None, so this is a no-op change for every pre-existing
+    caller.
     """
     _validate_response_id(response_id)
-    _request("POST", f"/v1/agent/{response_id}/cancel")
+    _request("POST", f"/v1/agent/{response_id}/cancel", deadline=deadline)
     return (
         f"Cancellation requested for {response_id}. The run stops shortly after; "
         "check with perplexity_agent_result if you need its terminal status."
@@ -672,14 +692,341 @@ def handle_ping(params: dict[str, object]) -> dict[str, object]:
     return {}
 
 
+# --- Tools -------------------------------------------------------------------
+
+_RECENCY_VALUES = frozenset({"hour", "day", "week", "month", "year"})
+_MAX_DOMAINS = 20
+
+
+class ToolInputError(Exception):
+    """A bad tool argument.
+
+    Surfaced as isError: true, NOT as JSON-RPC -32602. Since MCP 2025-11-25
+    (SEP-1303) validation failures belong in the tool result so the calling
+    model can read them and correct itself.
+    """
+
+
+def _require_str(args: dict[str, object], name: str) -> str:
+    value = args.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ToolInputError(f"'{name}' is required and must be a non-empty string.")
+    return value.strip()
+
+
+def _optional_recency(args: dict[str, object]) -> str | None:
+    value = args.get("recency")
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _RECENCY_VALUES:
+        raise ToolInputError(f"'recency' must be one of: {', '.join(sorted(_RECENCY_VALUES))}.")
+    return value
+
+
+def _optional_domains(args: dict[str, object]) -> list[str] | None:
+    value = args.get("domains")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(d, str) for d in value):
+        raise ToolInputError("'domains' must be an array of strings.")
+    if len(value) > _MAX_DOMAINS:
+        raise ToolInputError(f"'domains' accepts at most {_MAX_DOMAINS} entries.")
+    return [d for d in value if d.strip()]
+
+
+def _terminal_or_raise(payload: dict[str, object]) -> str:
+    """Render a terminal payload, or raise if the run failed."""
+    status = payload.get("status")
+    if status == "failed":
+        error = payload.get("error")
+        detail = ""
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            detail = f": {error['message']}"
+        raise PerplexityError(f"The research run failed{detail}")
+    if status == "cancelled":
+        raise PerplexityError("The research run was cancelled.")
+    return _format_answer(payload)
+
+
+def _collect_instructions(response_id: str, progress: str) -> str:
+    return (
+        f"Research run {response_id} is still running.\n"
+        f"Progress: {progress}\n\n"
+        f'Collect it with perplexity_agent_result(response_id="{response_id}"). '
+        "Pass wait_seconds to block until it finishes, or call it again later. "
+        f"If you no longer need it, stop it with "
+        f'perplexity_agent_cancel(response_id="{response_id}").'
+    )
+
+
+def tool_agent(args: dict[str, object], notify: ProgressFn | None) -> str:
+    query = _require_str(args, "query")
+    preset = args.get("preset", "medium")
+    if not isinstance(preset, str) or not preset.strip():
+        raise ToolInputError("'preset' must be a non-empty string.")
+    recency = _optional_recency(args)
+    domains = _optional_domains(args)
+
+    wait = args.get("wait", True)
+    if not isinstance(wait, bool):
+        raise ToolInputError("'wait' must be a boolean.")
+
+    # ONE deadline for the WHOLE tool call, not just the poll phase. Carried
+    # forward from Task 4/5's review: without this, _submit's own retry loop
+    # (inside _request, up to roughly 90s worst case — see its docstring)
+    # runs to completion BEFORE _poll even starts, and a _poll then handed a
+    # fresh full _wait_budget() on top means the two calls' worst cases
+    # simply add. WAIT_SECONDS_DEFAULT is 55, not something rounder,
+    # precisely because Claude Desktop enforces an unconfigurable 60s
+    # tool-call timeout — that ceiling has to bound this entire function.
+    started = time.monotonic()
+    deadline = started + _wait_budget()
+
+    response_id = _submit(query, preset.strip(), recency, domains, deadline=deadline)
+    if not wait:
+        return _collect_instructions(response_id, "just submitted")
+
+    # Whatever _submit just spent is gone from the shared clock — _poll gets
+    # what's left, never a fresh budget of its own. A negative remainder
+    # (submit alone exhausted the deadline) is handled the same way _poll
+    # already handles a deadline in the past: one bounded attempt, then give
+    # up — see _request's docstring — so this never needs clamping below 0.
+    remaining = deadline - time.monotonic()
+    payload, terminal = _poll(response_id, budget=remaining, notify=notify)
+    if terminal:
+        return _terminal_or_raise(payload)
+    return _collect_instructions(
+        response_id, _progress_summary(payload, time.monotonic() - started)
+    )
+
+
+def tool_result(args: dict[str, object], notify: ProgressFn | None) -> str:
+    response_id = _require_str(args, "response_id")
+    raw_wait = args.get("wait_seconds", 0)
+    if isinstance(raw_wait, bool) or not isinstance(raw_wait, int) or raw_wait < 0:
+        raise ToolInputError("'wait_seconds' must be a non-negative integer.")
+    budget = float(min(raw_wait, _wait_budget()))
+
+    payload, terminal = _poll(response_id, budget=budget, notify=notify)
+    if terminal:
+        return _terminal_or_raise(payload)
+    return _collect_instructions(response_id, _progress_summary(payload, budget))
+
+
+def tool_cancel(args: dict[str, object], notify: ProgressFn | None) -> str:
+    response_id = _require_str(args, "response_id")
+    # Same end-to-end budgeting as tool_agent above: left unbounded, _cancel's
+    # own call through _request could retry for up to ~90s on its own (see
+    # _request's docstring), with nothing tying it to the 55s ceiling Claude
+    # Desktop's unconfigurable tool-call timeout requires.
+    deadline = time.monotonic() + _wait_budget()
+    try:
+        return _cancel(response_id, deadline=deadline)
+    except PerplexityError as exc:
+        # Upstream 400 means the run is already terminal — the goal state is
+        # already reached, so this is benign rather than a failure.
+        if "already" in exc.message.lower() or "terminal" in exc.message.lower():
+            return f"Run {response_id} had already finished or was already cancelled."
+        raise
+
+
+TOOL_SCHEMAS: list[dict[str, object]] = [
+    {
+        "name": "perplexity_agent",
+        "title": "Perplexity Agent Research",
+        "description": (
+            "Run a research query through Perplexity's Agent API (multi-step web "
+            "research with citations). Use for deep or multi-hop questions where a "
+            "single synthesized, sourced answer is wanted. With wait=true (default) "
+            "this blocks until the answer is ready; if it takes too long you get a "
+            "response_id to collect later with perplexity_agent_result."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The research question.",
+                },
+                "preset": {
+                    "type": "string",
+                    "default": "medium",
+                    "description": "Research depth: fast, low, medium, high, "
+                    "xhigh, wide-research. Deeper takes longer.",
+                },
+                "recency": {
+                    "type": "string",
+                    "enum": ["hour", "day", "week", "month", "year"],
+                    "description": "Only use sources published within this window.",
+                },
+                "domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                    "description": "Restrict sources to these domains. Prefix "
+                    "with '-' to exclude. Allowlist or denylist, "
+                    "not both.",
+                },
+                "wait": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Block until the answer is ready. Set false to "
+                    "get a response_id immediately — useful for "
+                    "running several deep queries in parallel while "
+                    "you do other work.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "perplexity_agent_result",
+        "title": "Collect Perplexity Research",
+        "description": (
+            "Retrieve the result of a research run started by perplexity_agent. If it "
+            "is still running, reports what it has done so far and how to check again."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "response_id": {
+                    "type": "string",
+                    "description": "The response_id from perplexity_agent.",
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Block up to this many seconds waiting "
+                    "for completion. 0 checks once.",
+                },
+            },
+            "required": ["response_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "perplexity_agent_cancel",
+        "title": "Cancel Perplexity Research",
+        "description": (
+            "Stop a research run that is no longer needed. Perplexity does not report "
+            "usage for cancelled runs, so this cannot tell you whether it changed your "
+            "bill."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "response_id": {
+                    "type": "string",
+                    "description": "The response_id from perplexity_agent.",
+                },
+            },
+            "required": ["response_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        },
+    },
+]
+
+TOOL_IMPLS: dict[str, Callable[[dict[str, object], ProgressFn | None], str]] = {
+    "perplexity_agent": tool_agent,
+    "perplexity_agent_result": tool_result,
+    "perplexity_agent_cancel": tool_cancel,
+}
+
+
 def handle_tools_list(params: dict[str, object]) -> dict[str, object]:
-    return {"tools": []}  # populated in Task 6
+    return {"tools": TOOL_SCHEMAS}
+
+
+def handle_tools_call(params: dict[str, object]) -> dict[str, object]:
+    """Run a tool.
+
+    Note the split: failures in FINDING the tool are protocol errors, while
+    everything that happens once we are inside it — bad arguments, upstream
+    failures, timeouts — is a tool result with isError: true, so the model can
+    read the message and try something else.
+    """
+    name = params.get("name")
+    impl = TOOL_IMPLS.get(name) if isinstance(name, str) else None
+    if impl is None:
+        raise _ProtocolError(INVALID_PARAMS, f"Unknown tool: {name!r}")
+
+    args = params.get("arguments")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        raise _ProtocolError(INVALID_PARAMS, "'arguments' must be an object.")
+
+    notify = _progress_notifier(params)
+
+    try:
+        text = impl(args, notify)
+    except (ToolInputError, PerplexityError) as exc:
+        return _tool_text(str(exc), is_error=True)
+    except Exception as exc:  # broad and intentional: never leak a traceback to a model
+        _log(f"unhandled error in {name}: {type(exc).__name__}")
+        return _tool_text(
+            "The tool failed unexpectedly. Check the server's stderr log.", is_error=True
+        )
+    return _tool_text(text, is_error=False)
+
+
+def _tool_text(text: str, is_error: bool) -> dict[str, object]:
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+class _ProtocolError(Exception):
+    """Raised inside a handler to produce a JSON-RPC error rather than a result."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
+    """Build a progress emitter, but only if the client asked for one.
+
+    A server may only send notifications/progress referencing a token the client
+    supplied. Claude Desktop never supplies one; VS Code does and shows it in the
+    UI; Claude Code uses it to reset its idle timer. So this is pure upside where
+    available and a no-op everywhere else — nothing depends on it.
+    """
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    token = meta.get("progressToken")
+    if not isinstance(token, (str, int)) or isinstance(token, bool):
+        return None
+
+    def notify(message: str) -> None:
+        _write(
+            _STDOUT,
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": 0, "message": message},
+            },
+        )
+
+    return notify
 
 
 HANDLERS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "initialize": handle_initialize,
     "ping": handle_ping,
     "tools/list": handle_tools_list,
+    "tools/call": handle_tools_call,
 }
 
 
@@ -710,6 +1057,8 @@ def dispatch(message: dict[str, object]) -> dict[str, object] | None:
 
     try:
         return _response(request_id, handler(params))
+    except _ProtocolError as exc:
+        return _error(request_id, exc.code, exc.message)
     except Exception as exc:  # broad and intentional: the read loop must never die
         _log(f"internal error in {method}: {type(exc).__name__}")
         return _error(request_id, INTERNAL_ERROR, "Internal server error.")

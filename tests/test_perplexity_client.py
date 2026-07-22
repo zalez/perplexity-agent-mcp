@@ -600,6 +600,35 @@ class TestSubmit(AuthedClientTestCase):
         with self.assertRaises(srv.PerplexityError):
             srv._submit("why?", "medium", None, None)
 
+    def test_submit_forwards_a_given_deadline_to_request(self) -> None:
+        """Carried from Task 4/5's review (Finding 1, continued): _submit's
+        own call into _request can retry for up to ~90s on its own when
+        given no deadline (see _request's docstring). A tool call must be
+        able to bound _submit the same end-to-end way _poll already bounds
+        itself — this is the wiring that makes that possible.
+        """
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._request",
+            return_value={"id": "resp_x", "status": "queued"},
+        ) as mock_request:
+            deadline = time.monotonic() + 42.0
+            srv._submit("why?", "medium", None, None, deadline=deadline)
+        self.assertEqual(mock_request.call_args.kwargs["deadline"], deadline)
+
+    def test_submit_defaults_to_no_deadline(self) -> None:
+        """The default. Every OTHER test in this class calls _submit with no
+        deadline at all, and that must remain exactly as unbounded as
+        before this parameter existed — see _request's own
+        `deadline is None` guarantee, which this new parameter simply
+        forwards into.
+        """
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._request",
+            return_value={"id": "resp_x", "status": "queued"},
+        ) as mock_request:
+            srv._submit("why?", "medium", None, None)
+        self.assertIsNone(mock_request.call_args.kwargs["deadline"])
+
 
 class TestPoll(AuthedClientTestCase):
     def test_returns_immediately_when_already_terminal(self) -> None:
@@ -723,6 +752,31 @@ class TestCancel(AuthedClientTestCase):
         message = srv._cancel("resp_x").lower()
         for word in ("bill", "cost", "charge", "refund", "money", "save"):
             self.assertNotIn(word, message)
+
+    def test_cancel_forwards_a_given_deadline_to_request(self) -> None:
+        """Same wiring requirement as _submit above: _cancel's own retry
+        loop inside _request is otherwise unbounded (see _request's
+        docstring), and a tool call must be able to cap it end to end.
+        """
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._request",
+            return_value={"response_id": "resp_x", "status": "cancelling"},
+        ) as mock_request:
+            deadline = time.monotonic() + 42.0
+            srv._cancel("resp_x", deadline=deadline)
+        self.assertEqual(mock_request.call_args.kwargs["deadline"], deadline)
+
+    def test_cancel_defaults_to_no_deadline(self) -> None:
+        """The default. Every OTHER test in this class calls _cancel with no
+        deadline, and that must stay exactly as unbounded as before this
+        parameter existed.
+        """
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._request",
+            return_value={"response_id": "resp_x", "status": "cancelling"},
+        ) as mock_request:
+            srv._cancel("resp_x")
+        self.assertIsNone(mock_request.call_args.kwargs["deadline"])
 
 
 if __name__ == "__main__":

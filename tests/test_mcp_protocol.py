@@ -351,5 +351,110 @@ class TestReadLoopSurvival(unittest.TestCase):
         self.assertEqual(replies, [{"jsonrpc": "2.0", "id": 9, "result": {}}])
 
 
+class TestToolListing(unittest.TestCase):
+    def test_all_three_tools_are_listed(self) -> None:
+        replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        names = [t["name"] for t in replies[1]["result"]["tools"]]
+        self.assertEqual(
+            names, ["perplexity_agent", "perplexity_agent_result", "perplexity_agent_cancel"]
+        )
+
+    def test_schemas_are_well_formed(self) -> None:
+        replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        for tool in replies[1]["result"]["tools"]:
+            with self.subTest(tool=tool["name"]):
+                self.assertEqual(tool["inputSchema"]["type"], "object")
+                self.assertIn("description", tool)
+                self.assertIs(tool["inputSchema"]["additionalProperties"], False)
+
+    def test_annotations_are_honest(self) -> None:
+        replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        by_name = {t["name"]: t for t in replies[1]["result"]["tools"]}
+        self.assertIs(by_name["perplexity_agent"]["annotations"]["readOnlyHint"], True)
+        # Cancel changes upstream state and is not idempotent — say so.
+        cancel = by_name["perplexity_agent_cancel"]["annotations"]
+        self.assertIs(cancel["readOnlyHint"], False)
+        self.assertIs(cancel["destructiveHint"], True)
+        self.assertIs(cancel["idempotentHint"], False)
+
+
+class TestToolCallErrors(unittest.TestCase):
+    def test_unknown_tool_is_a_protocol_error(self) -> None:
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "nope", "arguments": {}},
+            },
+        )
+        self.assertEqual(replies[1]["error"]["code"], -32602)
+
+    def test_missing_api_key_is_a_tool_error_not_a_protocol_error(self) -> None:
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "perplexity_agent", "arguments": {"query": "x"}},
+            },
+        )
+        result = replies[1]["result"]
+        self.assertIs(result["isError"], True)
+        self.assertIn("PERPLEXITY_API_KEY", result["content"][0]["text"])
+        self.assertNotIn("Traceback", result["content"][0]["text"])
+
+    def test_bad_argument_is_a_tool_error_not_invalid_params(self) -> None:
+        """SEP-1303: validation errors are isError so the model can self-correct."""
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "perplexity_agent", "arguments": {"query": ""}},
+            },
+            env={"PERPLEXITY_API_KEY": "pplx-unused"},
+        )
+        self.assertNotIn("error", replies[1])
+        self.assertIs(replies[1]["result"]["isError"], True)
+
+    def test_malformed_response_id_is_a_tool_error_not_a_protocol_error(self) -> None:
+        """A second PerplexityError raise site (_validate_response_id, deep
+        inside _poll), reached via perplexity_agent_result rather than
+        perplexity_agent's _api_key() — proves handle_tools_call's
+        PerplexityError catch isn't somehow specific to the one path the
+        test above happens to exercise. No network access occurs: the
+        malformed id is rejected before any request is made.
+
+        Also asserts on the message text, not just isError — a broad
+        `except Exception` fallback would ALSO produce isError: true for an
+        uncaught PerplexityError, but with a useless generic message instead
+        of the actionable one. Checking the text is what actually proves the
+        specific (ToolInputError, PerplexityError) catch is doing its job,
+        rather than the fallback silently doing it instead.
+        """
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "perplexity_agent_result",
+                    "arguments": {"response_id": "../etc/passwd"},
+                },
+            },
+            env={"PERPLEXITY_API_KEY": "pplx-unused"},
+        )
+        result = replies[1]["result"]
+        self.assertNotIn("error", replies[1])
+        self.assertIs(result["isError"], True)
+        self.assertIn("response_id", result["content"][0]["text"])
+        self.assertNotIn("unexpectedly", result["content"][0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
