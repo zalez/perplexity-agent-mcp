@@ -8,6 +8,8 @@ takes, minus the JSON-RPC envelope (covered in test_mcp_protocol.py).
 
 from __future__ import annotations
 
+import io
+import json
 import time
 import unittest
 import unittest.mock
@@ -98,9 +100,64 @@ class TestResultTool(LifecycleTestCase):
             srv.tool_result({"response_id": "resp_x"}, None)
         self.assertIn("model overloaded", ctx.exception.message)
 
+    def test_failed_run_error_message_is_truncated_visibly(self) -> None:
+        """Finding 5: a failed run's error.message had no length cap in
+        _terminal_or_raise, unlike every other upstream string this module
+        echoes — the real ceiling used to be only the 32 MiB HTTP response
+        cap, nowhere near safe to hand a model directly.
+        """
+        long_message = "x" * (srv._MAX_ERROR_CHARS + 100)
+        self.fake.script(
+            (200, {"status": "failed", "output": [], "error": {"message": long_message}})
+        )
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv.tool_result({"response_id": "resp_x"}, None)
+        self.assertNotIn(long_message, ctx.exception.message, "the full message must not pass")
+        self.assertIn("…", ctx.exception.message, "truncation must be visible, not silent")
+
     def test_malformed_id_is_an_input_error(self) -> None:
         with self.assertRaises((srv.ToolInputError, srv.PerplexityError)):
             srv.tool_result({"response_id": "../etc/passwd"}, None)
+
+    def test_null_response_id_is_still_rejected(self) -> None:
+        """Finding 6: response_id is required, unlike the optional
+        arguments below — an explicit null must NOT fall back to a
+        default, because there is none.
+        """
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_result({"response_id": None}, None)
+
+    def test_boolean_wait_seconds_is_rejected(self) -> None:
+        """Finding 2c: Python's bool is an int subclass, so without this
+        explicit guard wait_seconds: true would be silently accepted as
+        the integer 1.
+        """
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_result({"response_id": "resp_x", "wait_seconds": True}, None)
+
+    def test_wait_seconds_above_the_budget_is_clamped_not_honoured(self) -> None:
+        """Finding 2a: wait_seconds: 600 must not reach _poll as 600 when
+        the wait budget is smaller — min(raw_wait, _wait_budget()) is the
+        only thing keeping an oversized request inside the client-side
+        ceiling WAIT_SECONDS_DEFAULT exists to respect.
+        """
+        with (
+            unittest.mock.patch(
+                "perplexity_agent_mcp._poll", return_value=(COMPLETED, True)
+            ) as mock_poll,
+            unittest.mock.patch.dict("os.environ", {"PERPLEXITY_AGENT_WAIT_SECONDS": "5"}),
+        ):
+            srv.tool_result({"response_id": "resp_x", "wait_seconds": 600}, None)
+        self.assertEqual(mock_poll.call_args.kwargs["budget"], 5.0)
+
+    def test_null_wait_seconds_falls_back_to_checking_once(self) -> None:
+        """Finding 6: same uniform-null treatment as recency/domains already
+        get — an explicit null for wait_seconds must behave like the
+        absent key (a single, non-blocking check), not raise.
+        """
+        self.fake.script((200, RUNNING))
+        text = srv.tool_result({"response_id": "resp_x", "wait_seconds": None}, None)
+        self.assertIn("still running", text.lower())
 
 
 class TestValidation(LifecycleTestCase):
@@ -120,12 +177,62 @@ class TestValidation(LifecycleTestCase):
         with self.assertRaises(srv.ToolInputError):
             srv.tool_agent({"query": "x", "domains": [f"d{i}.com" for i in range(21)]}, None)
 
+    def test_domains_with_a_non_string_entry_is_rejected(self) -> None:
+        """Finding 2d: no test previously exercised this branch of
+        _optional_domains at all.
+        """
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_agent({"query": "x", "domains": ["nasa.gov", 42]}, None)
+
+    def test_non_bool_wait_is_rejected(self) -> None:
+        """Finding 2b."""
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_agent({"query": "x", "wait": "true"}, None)
+
+    def test_non_string_preset_is_rejected(self) -> None:
+        """Finding 2e."""
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_agent({"query": "x", "preset": 7}, None)
+
+    def test_empty_preset_is_rejected(self) -> None:
+        """Finding 2e."""
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_agent({"query": "x", "preset": "   "}, None)
+
     def test_unknown_preset_is_passed_through(self) -> None:
         """The upstream schema has no enum; allowlisting would reject valid values."""
         self.fake.script((200, {"id": "resp_x", "status": "queued"}))
         srv.tool_agent({"query": "x", "preset": "some-future-preset", "wait": False}, None)
         _, _, body = self.fake.requests[0]
         self.assertEqual(body["preset"], "some-future-preset")
+
+    def test_null_query_is_still_rejected(self) -> None:
+        """Finding 6: query is required, unlike the optional arguments
+        below — an explicit null must NOT fall back to a default, because
+        there is none.
+        """
+        with self.assertRaises(srv.ToolInputError):
+            srv.tool_agent({"query": None}, None)
+
+    def test_null_preset_falls_back_to_the_default(self) -> None:
+        """Finding 6: an explicit null for an optional argument must mean
+        "not supplied", same as an absent key — not a stricter error.
+        recency/domains already behaved this way; preset did not, because
+        dict.get(name, default) only supplies default for a MISSING key.
+        """
+        self.fake.script((200, {"id": "resp_x", "status": "queued"}))
+        srv.tool_agent({"query": "x", "preset": None, "wait": False}, None)
+        _, _, body = self.fake.requests[0]
+        self.assertEqual(body["preset"], "medium")
+
+    def test_null_wait_falls_back_to_the_default_of_true(self) -> None:
+        """Finding 6, same requirement for `wait`."""
+        self.fake.script(
+            (200, {"id": "resp_x", "status": "queued"}),
+            (200, COMPLETED),
+        )
+        text = srv.tool_agent({"query": "x", "wait": None}, None)
+        self.assertIn("First part. Second part.", text, "null wait must default to wait=True")
 
 
 class TestCancelTool(LifecycleTestCase):
@@ -139,6 +246,48 @@ class TestCancelTool(LifecycleTestCase):
         self.fake.script((400, {"error": {"message": "already terminal"}}))
         text = srv.tool_cancel({"response_id": "resp_x"}, None)
         self.assertIn("already", text.lower())
+
+    def test_cancelling_a_run_with_no_upstream_message_is_still_benign(self) -> None:
+        """Finding 1, half A: a 400 with no error body at all falls back to
+        this module's own generic message ("Perplexity returned HTTP
+        400.", from _error_message), which contains neither "already" nor
+        "terminal". The OLD substring-based check would have wrongly
+        RAISED here, misreporting Perplexity's own documented "already
+        terminal" case as a failure. Keying on the status code instead
+        fixes it: 400 is 400 regardless of what prose (if any) came with
+        it.
+        """
+        self.fake.script((400, {}))
+        text = srv.tool_cancel({"response_id": "resp_x"}, None)
+        self.assertIn("already", text.lower())
+
+    def test_cancelling_a_revoked_key_run_still_raises_despite_the_word_already(self) -> None:
+        """Finding 1, half B — the dangerous direction: a 401 body that
+        happens to CONTAIN the word "already" ("Your API key has already
+        been revoked") must still raise. The OLD substring match on
+        "already"/"terminal" in the message text would have returned this
+        as BENIGN — telling the calling model a state-changing cancel
+        succeeded when the request never even authenticated. Status 401 is
+        not 400, so the fixed status-keyed check must raise.
+        """
+        self.fake.script((401, {"error": {"message": "Your API key has already been revoked"}}))
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv.tool_cancel({"response_id": "resp_x"}, None)
+        self.assertIn("revoked", ctx.exception.message)
+
+    def test_cancel_network_error_still_raises(self) -> None:
+        """Finding 1: a network-level failure never reaches an HTTP status
+        at all — PerplexityError.status stays None — so it can never be
+        mistaken for the benign 400 case, whatever wording ends up in its
+        message.
+        """
+        with (
+            unittest.mock.patch("urllib.request.urlopen", side_effect=OSError("boom")),
+            unittest.mock.patch("perplexity_agent_mcp.time.sleep"),
+        ):
+            with self.assertRaises(srv.PerplexityError) as ctx:
+                srv.tool_cancel({"response_id": "resp_x"}, None)
+        self.assertIsNone(ctx.exception.status)
 
     def test_unknown_id_is_an_error(self) -> None:
         self.fake.script((404, {"error": {"message": "not found"}}))
@@ -253,6 +402,48 @@ class TestEndToEndDeadline(LifecycleTestCase):
             "submit and poll must share one deadline, not each get a full budget",
         )
         self.assertIn("resp_x", text)
+
+
+class TestWithDefault(unittest.TestCase):
+    """Finding 6: explicit `null` for an optional argument must be
+    indistinguishable from an absent key. Direct unit coverage of the
+    helper itself, alongside the per-tool integration tests in
+    TestValidation/TestResultTool above that prove it is actually wired
+    into preset/wait/wait_seconds.
+    """
+
+    def test_absent_key_uses_the_default(self) -> None:
+        self.assertEqual(srv._with_default({}, "preset", "medium"), "medium")
+
+    def test_explicit_null_uses_the_default_too(self) -> None:
+        self.assertEqual(srv._with_default({"preset": None}, "preset", "medium"), "medium")
+
+    def test_a_real_value_passes_through_unchanged(self) -> None:
+        self.assertEqual(srv._with_default({"preset": "high"}, "preset", "medium"), "high")
+
+
+class TestProgressNotifier(unittest.TestCase):
+    """Finding 7: _progress_notifier's own JSON-RPC payload shape — that the
+    numeric `progress` field genuinely carries whatever it is given (not a
+    hardcoded 0), and that `total` is never sent (an open-ended research
+    run has no meaningful denominator; see the comment in
+    _progress_notifier). TestPoll.test_progress_value_increases_across_notifications
+    (test_perplexity_client.py) proves _poll feeds this an advancing
+    number; this proves the wire-level closure honours whatever it's given
+    instead of re-hardcoding it.
+    """
+
+    def test_notification_carries_the_given_progress_value_and_omits_total(self) -> None:
+        captured = io.StringIO()
+        with unittest.mock.patch.object(srv, "_STDOUT", captured):
+            notify = srv._progress_notifier({"_meta": {"progressToken": "tok-1"}})
+            assert notify is not None
+            notify("status queued after 3s", 3.0)
+        message = json.loads(captured.getvalue())
+        params = message["params"]
+        self.assertEqual(params["progressToken"], "tok-1")
+        self.assertEqual(params["progress"], 3.0)
+        self.assertNotIn("total", params, "total is unknown for an open-ended research run")
 
 
 if __name__ == "__main__":

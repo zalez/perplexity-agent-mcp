@@ -74,6 +74,42 @@ class TestRequest(AuthedClientTestCase):
             srv._request("GET", "/v1/agent/resp_1")
         self.assertIn("Invalid API key", ctx.exception.message)
 
+    def test_upstream_error_message_is_truncated_visibly(self) -> None:
+        """Finding 5: `_error_message`'s echoed upstream message had no
+        length cap, unlike every other upstream string this module echoes
+        to a model (source titles, urls, status). The real ceiling used to
+        be only the 32 MiB HTTP response cap.
+        """
+        long_message = "x" * (srv._MAX_ERROR_CHARS + 100)
+        self.fake.script((400, {"error": {"message": long_message}}))
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv._request("GET", "/v1/agent/resp_1")
+        self.assertEqual(len(ctx.exception.message), srv._MAX_ERROR_CHARS)
+        self.assertTrue(
+            ctx.exception.message.endswith("…"), "truncation must be visible, not silent"
+        )
+
+    def test_non_retryable_http_error_carries_the_status(self) -> None:
+        """Finding 1: PerplexityError.status lets a caller (tool_cancel) make
+        status-coded decisions without parsing prose Perplexity never
+        promises to keep stable.
+        """
+        self.fake.script((400, {"error": {"message": "bad"}}))
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv._request("GET", "/v1/agent/resp_1")
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_network_error_has_no_status(self) -> None:
+        """The other half of Finding 1's fix: a failure that never reached
+        an HTTP response must never be mistaken for one, whatever status
+        code a caller might otherwise be tempted to assume.
+        """
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=OSError("boom")):
+            with unittest.mock.patch("perplexity_agent_mcp.time.sleep"):
+                with self.assertRaises(srv.PerplexityError) as ctx:
+                    srv._request("GET", "/v1/agent/resp_1")
+        self.assertIsNone(ctx.exception.status)
+
     def test_error_code_as_string_is_tolerated(self) -> None:
         """Their OpenAPI says code is a string; the live API returns an int."""
         self.fake.script((400, {"error": {"message": "bad", "code": "400"}}))
@@ -729,10 +765,25 @@ class TestPoll(AuthedClientTestCase):
         # Same reasoning as test_polls_until_terminal: budget=30 means the
         # interval, not the budget, governs, so patch it out.
         with unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep:
-            srv._poll("resp_x", budget=30, notify=seen.append)
+            srv._poll("resp_x", budget=30, notify=lambda message, _progress: seen.append(message))
         self.assertTrue(seen)
         self.assertIn("status", seen[0])
         self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [2.0])
+
+    def test_progress_value_increases_across_notifications(self) -> None:
+        """Finding 7: MCP's progress utility requires the `progress` value
+        to increase with every notification for a given token, even with an
+        unknown total. `_poll` used to hand `_progress_notifier`'s closure a
+        hardcoded 0 on every call; it already has `elapsed` in hand, so this
+        proves that value is actually threaded through notify(), not just
+        sitting unused in a local variable.
+        """
+        self.fake.script((200, QUEUED), (200, RUNNING), (200, COMPLETED))
+        seen: list[float] = []
+        with unittest.mock.patch("perplexity_agent_mcp.time.sleep"):
+            srv._poll("resp_x", budget=30, notify=lambda _message, progress: seen.append(progress))
+        self.assertEqual(len(seen), 2, "two non-terminal polls (QUEUED, RUNNING) before COMPLETED")
+        self.assertLess(seen[0], seen[1], "progress must strictly increase across notifications")
 
     def test_rejects_a_malformed_response_id(self) -> None:
         with self.assertRaises(srv.PerplexityError):

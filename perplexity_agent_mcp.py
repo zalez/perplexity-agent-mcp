@@ -126,11 +126,22 @@ class PerplexityError(Exception):
     """An upstream or transport failure, carrying a message safe to show a model.
 
     `message` never contains the API key, request headers, or a stack trace.
+
+    `status` is the upstream HTTP status code, when this error was raised
+    directly from a non-retryable HTTPError response (see `_request`) —
+    `None` for every network-level failure (no HTTP response was ever
+    received) and for the exhausted-retries case (whose message can
+    summarize more than one attempt, of possibly different failure types,
+    so no single status would be honest to report). Exists so a caller can
+    make status-CODED decisions — e.g. tool_cancel's "already terminal"
+    check (Finding 1) — without parsing upstream prose Perplexity never
+    promises to keep stable; only the 400 status itself is documented.
     """
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.message = message
+        self.status = status
 
 
 def _api_key() -> str:
@@ -153,6 +164,30 @@ def _validate_response_id(response_id: str) -> str:
     return response_id
 
 
+# Same defensive bound this module applies to every OTHER echoed upstream
+# string (_MAX_TITLE_CHARS / _MAX_URL_CHARS / _MAX_STATUS_CHARS, all in BAND
+# 3 below, each with a comment making the same point): an upstream error
+# message is still just upstream prose, and until this fix it was the ONE
+# echoed string with no length cap at all — the real ceiling was only
+# _MAX_RESPONSE_BYTES (32 MiB), nowhere near safe to hand a model directly.
+# Lives here, in BAND 2, rather than beside its BAND-3 siblings, because
+# _error_message() below — which needs it — is itself BAND 2 code, and this
+# file's bands may depend only on the band above (see the BAND 2 banner
+# comment); _terminal_or_raise() in BAND 3 reuses the same constant for the
+# structurally identical error.message field on a failed run, which is fine
+# since BAND 3 already depends on BAND 2.
+_MAX_ERROR_CHARS = 500
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters, marking a real cut with an
+    ellipsis so a chopped string can never quietly pass as the complete one.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def _error_message(payload: dict[str, object], status: int) -> str:
     """Pull a human-readable message out of an upstream error body.
 
@@ -164,7 +199,7 @@ def _error_message(payload: dict[str, object], status: int) -> str:
     if isinstance(error, dict):
         message = error.get("message")
         if isinstance(message, str) and message:
-            return message
+            return _truncate(message, _MAX_ERROR_CHARS)
     return f"Perplexity returned HTTP {status}."
 
 
@@ -255,7 +290,10 @@ def _request(
                 message = _error_message(payload, exc.code)
                 if exc.code not in _RETRY_STATUSES:
                     # A bad request retried is just a slower bad request.
-                    raise PerplexityError(message) from None
+                    # status=exc.code is what lets tool_cancel key its
+                    # "already terminal" check on the STATUS (Finding 1)
+                    # instead of sniffing this message's prose.
+                    raise PerplexityError(message, status=exc.code) from None
                 last_error = message
         except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
             # Deliberately record only the exception TYPE. Messages from socket
@@ -307,7 +345,8 @@ def _safe_json(raw: bytes) -> dict[str, object]:
 # =============================================================================
 
 # Bound the payload so a runaway deep-research run cannot exhaust a client's
-# context window.
+# context window. (`_truncate` itself, used below and by _MAX_ERROR_CHARS's
+# comment-mate in BAND 2, now lives up there — see its comment for why.)
 _MAX_ANSWER_CHARS = 60_000
 _MAX_SOURCES = 50
 # Completes the bound above: without a per-title cap, up to _MAX_SOURCES
@@ -327,15 +366,6 @@ _MAX_URL_CHARS = 2000
 # not retrieved web content (see `_progress_summary`) — but it is still
 # echoed into client-facing text, so it gets the same defensive bound.
 _MAX_STATUS_CHARS = 100
-
-
-def _truncate(text: str, limit: int) -> str:
-    """Cut `text` to at most `limit` characters, marking a real cut with an
-    ellipsis so a chopped string can never quietly pass as the complete one.
-    """
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
 
 
 def _items(payload: dict[str, object], kind: str) -> list[dict[str, object]]:
@@ -478,7 +508,13 @@ def _format_answer(payload: dict[str, object]) -> str:
 
 # --- Running a research job --------------------------------------------------
 
-ProgressFn = Callable[[str], None]
+# (message, progress) -> None. `progress` MUST increase with every call for
+# a given token, per the MCP progress utility spec, even when there is no
+# known total (Finding 7). `_poll` below is the only caller that ever
+# invokes this, and always passes its own elapsed-seconds clock, which
+# increases by construction across polls — each is separated by a real
+# network round trip plus a sleep (see _poll's loop).
+ProgressFn = Callable[[str, float], None]
 
 # Statuses from which a run will never move again.
 TERMINAL = frozenset({"completed", "failed", "incomplete", "cancelled"})
@@ -592,7 +628,7 @@ def _poll(
             return payload, False
 
         if notify is not None:
-            notify(_progress_summary(payload, elapsed))
+            notify(_progress_summary(payload, elapsed), elapsed)
 
         # Don't overshoot the budget just to complete a sleep.
         time.sleep(min(interval, max(0.0, budget - elapsed)))
@@ -696,6 +732,13 @@ def handle_ping(params: dict[str, object]) -> dict[str, object]:
 
 _RECENCY_VALUES = frozenset({"hour", "day", "week", "month", "year"})
 _MAX_DOMAINS = 20
+# The wait_seconds schema's advertised ceiling (Finding 4). Computed once
+# at import time — accurate for this process's whole lifetime, since an MCP
+# server's env is set once, by the client's "env" block, before this module
+# is ever imported — rather than a fixed literal that could drift from what
+# _wait_budget() actually enforces once PERPLEXITY_AGENT_WAIT_SECONDS is
+# set. See TOOL_SCHEMAS' use of it below for the full reasoning.
+_WAIT_SECONDS_SCHEMA_MAX = _wait_budget()
 
 
 class ToolInputError(Exception):
@@ -734,14 +777,35 @@ def _optional_domains(args: dict[str, object]) -> list[str] | None:
     return [d for d in value if d.strip()]
 
 
+def _with_default(args: dict[str, object], name: str, default: object) -> object:
+    """Fetch an optional argument, treating an explicit `null` exactly like
+    an absent key (Finding 6): models emit `null` for optional arguments
+    routinely, and `recency`/`domains` above already tolerate it (a bare
+    `args.get(name)` returns `None` either way) — `preset`, `wait`, and
+    `wait_seconds` did not, because `dict.get(name, default)` only supplies
+    `default` when the KEY is missing, not when it is present and `None`.
+    `query` and `response_id` are required, have no default to fall back
+    to, and correctly keep rejecting `None` via `_require_str` instead —
+    this helper is only for arguments that have one.
+    """
+    value = args.get(name, default)
+    return default if value is None else value
+
+
 def _terminal_or_raise(payload: dict[str, object]) -> str:
     """Render a terminal payload, or raise if the run failed."""
     status = payload.get("status")
     if status == "failed":
         error = payload.get("error")
         detail = ""
-        if isinstance(error, dict) and isinstance(error.get("message"), str):
-            detail = f": {error['message']}"
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str):
+                # Same defensive bound as _error_message's HTTP-error path
+                # (Finding 5): a failed run's error.message was the one
+                # echoed upstream string in this module with no length cap
+                # at all — everything else BAND 3 echoes already gets one.
+                detail = f": {_truncate(message, _MAX_ERROR_CHARS)}"
         raise PerplexityError(f"The research run failed{detail}")
     if status == "cancelled":
         raise PerplexityError("The research run was cancelled.")
@@ -761,13 +825,13 @@ def _collect_instructions(response_id: str, progress: str) -> str:
 
 def tool_agent(args: dict[str, object], notify: ProgressFn | None) -> str:
     query = _require_str(args, "query")
-    preset = args.get("preset", "medium")
+    preset = _with_default(args, "preset", "medium")
     if not isinstance(preset, str) or not preset.strip():
         raise ToolInputError("'preset' must be a non-empty string.")
     recency = _optional_recency(args)
     domains = _optional_domains(args)
 
-    wait = args.get("wait", True)
+    wait = _with_default(args, "wait", True)
     if not isinstance(wait, bool):
         raise ToolInputError("'wait' must be a boolean.")
 
@@ -802,7 +866,7 @@ def tool_agent(args: dict[str, object], notify: ProgressFn | None) -> str:
 
 def tool_result(args: dict[str, object], notify: ProgressFn | None) -> str:
     response_id = _require_str(args, "response_id")
-    raw_wait = args.get("wait_seconds", 0)
+    raw_wait = _with_default(args, "wait_seconds", 0)
     if isinstance(raw_wait, bool) or not isinstance(raw_wait, int) or raw_wait < 0:
         raise ToolInputError("'wait_seconds' must be a non-negative integer.")
     budget = float(min(raw_wait, _wait_budget()))
@@ -823,9 +887,20 @@ def tool_cancel(args: dict[str, object], notify: ProgressFn | None) -> str:
     try:
         return _cancel(response_id, deadline=deadline)
     except PerplexityError as exc:
-        # Upstream 400 means the run is already terminal — the goal state is
-        # already reached, so this is benign rather than a failure.
-        if "already" in exc.message.lower() or "terminal" in exc.message.lower():
+        # Finding 1: key on the upstream STATUS, never on message prose.
+        # Perplexity's docs pin 400 for "already terminal"; they never pin
+        # the wording. Sniffing the message text was a real, dangerous bug:
+        # this module's OWN fallback for a 400 with no body ("Perplexity
+        # returned HTTP 400.") contains neither "already" nor "terminal" and
+        # so wrongly RAISED, while an unrelated 401 body that merely
+        # happened to contain the word "already" (e.g. "Your API key has
+        # already been revoked") wrongly matched and was reported BENIGN —
+        # telling the calling model a state-changing call had succeeded
+        # when it had not even authenticated. `status` is unambiguous: it
+        # is set only when `_request` raised directly from an HTTPError
+        # response, never for a network failure (which correctly keeps
+        # raising below, since `exc.status` stays `None`).
+        if exc.status == 400:
             return f"Run {response_id} had already finished or was already cancelled."
         raise
 
@@ -880,7 +955,24 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
             "required": ["query"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+        "annotations": {
+            # OWNER DECISION (Finding 8): be honest rather than convenient.
+            # This tool creates durable, billable, cancellable upstream
+            # state — the very state perplexity_agent_cancel's own
+            # destructiveHint: True below exists to remove — so
+            # readOnlyHint: True was simply untrue, and clients use
+            # readOnlyHint to decide whether a call needs the user's
+            # approval before running. destructiveHint is spelled out as
+            # False explicitly, rather than left to its default, because
+            # the MCP spec defaults destructiveHint to TRUE once
+            # readOnlyHint is False, and this tool destroys nothing —
+            # leaving it implicit would silently claim the opposite of
+            # what is true.
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        },
     },
     {
         "name": "perplexity_agent_result",
@@ -899,9 +991,19 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
                 "wait_seconds": {
                     "type": "integer",
                     "minimum": 0,
+                    # The true ceiling is this SERVER's own configured wait
+                    # budget, not a fixed literal that could drift from it —
+                    # see _WAIT_SECONDS_SCHEMA_MAX's own comment for why a
+                    # dynamically-computed value is both possible and more
+                    # honest here.
+                    "maximum": _WAIT_SECONDS_SCHEMA_MAX,
                     "default": 0,
-                    "description": "Block up to this many seconds waiting "
-                    "for completion. 0 checks once.",
+                    "description": (
+                        "Block up to this many seconds waiting for completion. "
+                        "0 checks once. A larger value is silently CLAMPED to "
+                        f"this server's configured wait budget ({_WAIT_SECONDS_SCHEMA_MAX}s "
+                        "here; set PERPLEXITY_AGENT_WAIT_SECONDS to raise it), never rejected."
+                    ),
                 },
             },
             "required": ["response_id"],
@@ -937,6 +1039,23 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
     },
 ]
 
+
+def _schemas_by_name(schemas: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    """name -> full schema, so handle_tools_call can enforce each tool's own
+    additionalProperties: false (Finding 3) off the SAME data tools/list
+    already returns, rather than a second, hand-maintained key list that
+    could drift from it.
+    """
+    by_name: dict[str, dict[str, object]] = {}
+    for schema in schemas:
+        name = schema["name"]
+        if isinstance(name, str):
+            by_name[name] = schema
+    return by_name
+
+
+TOOL_SCHEMAS_BY_NAME: dict[str, dict[str, object]] = _schemas_by_name(TOOL_SCHEMAS)
+
 TOOL_IMPLS: dict[str, Callable[[dict[str, object], ProgressFn | None], str]] = {
     "perplexity_agent": tool_agent,
     "perplexity_agent_result": tool_result,
@@ -948,6 +1067,29 @@ def handle_tools_list(params: dict[str, object]) -> dict[str, object]:
     return {"tools": TOOL_SCHEMAS}
 
 
+def _reject_unknown_arguments(schema: dict[str, object], args: dict[str, object]) -> None:
+    """Enforce the additionalProperties: false every TOOL_SCHEMAS entry
+    already declares but nothing previously checked (Finding 3):
+    {"query": "x", "bogus": "yes"} used to be silently accepted. Driven off
+    the tool's OWN declared schema, not a hardcoded key list per tool, so
+    the schema stays the single source of truth. Concrete harm this
+    prevents: a model that types "domain" instead of "domains" now gets an
+    actionable error naming both the bad key and the accepted ones, rather
+    than an UNFILTERED search silently presented as a filtered one.
+    """
+    accepted: set[str] = set()
+    input_schema = schema["inputSchema"]
+    if isinstance(input_schema, dict):
+        properties = input_schema.get("properties")
+        if isinstance(properties, dict):
+            accepted = set(properties)
+    unknown = sorted(set(args) - accepted)
+    if unknown:
+        raise ToolInputError(
+            f"Unknown argument(s): {', '.join(unknown)}. Accepted: {', '.join(sorted(accepted))}."
+        )
+
+
 def handle_tools_call(params: dict[str, object]) -> dict[str, object]:
     """Run a tool.
 
@@ -957,9 +1099,9 @@ def handle_tools_call(params: dict[str, object]) -> dict[str, object]:
     read the message and try something else.
     """
     name = params.get("name")
-    impl = TOOL_IMPLS.get(name) if isinstance(name, str) else None
-    if impl is None:
+    if not isinstance(name, str) or name not in TOOL_IMPLS:
         raise _ProtocolError(INVALID_PARAMS, f"Unknown tool: {name!r}")
+    impl = TOOL_IMPLS[name]
 
     args = params.get("arguments")
     if args is None:
@@ -970,6 +1112,7 @@ def handle_tools_call(params: dict[str, object]) -> dict[str, object]:
     notify = _progress_notifier(params)
 
     try:
+        _reject_unknown_arguments(TOOL_SCHEMAS_BY_NAME[name], args)
         text = impl(args, notify)
     except (ToolInputError, PerplexityError) as exc:
         return _tool_text(str(exc), is_error=True)
@@ -1009,13 +1152,30 @@ def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
     if not isinstance(token, (str, int)) or isinstance(token, bool):
         return None
 
-    def notify(message: str) -> None:
+    def notify(message: str, progress: float) -> None:
         _write(
             _STDOUT,
             {
                 "jsonrpc": "2.0",
                 "method": "notifications/progress",
-                "params": {"progressToken": token, "progress": 0, "message": message},
+                "params": {
+                    "progressToken": token,
+                    # MUST increase with every notification for this token
+                    # (MCP spec, Utilities/Progress), even with no known
+                    # total. Forwarding _poll's own elapsed-seconds clock
+                    # satisfies that for free (Finding 7): it increases by
+                    # construction, so this closure needs no counter state
+                    # of its own — this previously hardcoded 0 instead.
+                    "progress": progress,
+                    "message": message,
+                    # `total` is deliberately never sent: a research run's
+                    # duration is genuinely open-ended (seconds for "fast",
+                    # far more for "xhigh"/"wide-research", further bounded
+                    # only by whatever wait budget the caller chose), so
+                    # there is no meaningful denominator to report. The spec
+                    # explicitly allows this: "Omit the total value if
+                    # unknown."
+                },
             },
         )
 

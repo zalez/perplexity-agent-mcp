@@ -368,14 +368,65 @@ class TestToolListing(unittest.TestCase):
                 self.assertIs(tool["inputSchema"]["additionalProperties"], False)
 
     def test_annotations_are_honest(self) -> None:
+        """OWNER DECISION (Finding 8): be honest rather than convenient.
+        perplexity_agent creates durable, billable, cancellable upstream
+        state, so it is NOT read-only — clients use readOnlyHint to decide
+        whether a call needs the user's approval, and claiming read-only
+        would be false. destructiveHint is explicitly False (it defaults
+        to True once readOnlyHint is False) because this tool destroys
+        nothing. perplexity_agent_result genuinely only reads, so it keeps
+        readOnlyHint: true. perplexity_agent_cancel is unchanged: it
+        changes upstream state and is not idempotent.
+        """
         replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         by_name = {t["name"]: t for t in replies[1]["result"]["tools"]}
-        self.assertIs(by_name["perplexity_agent"]["annotations"]["readOnlyHint"], True)
+
+        agent = by_name["perplexity_agent"]["annotations"]
+        self.assertIs(agent["readOnlyHint"], False)
+        self.assertIs(agent["destructiveHint"], False)
+        self.assertIs(agent["idempotentHint"], False)
+        self.assertIs(agent["openWorldHint"], True)
+
+        result = by_name["perplexity_agent_result"]["annotations"]
+        self.assertIs(result["readOnlyHint"], True)
+
         # Cancel changes upstream state and is not idempotent — say so.
         cancel = by_name["perplexity_agent_cancel"]["annotations"]
         self.assertIs(cancel["readOnlyHint"], False)
         self.assertIs(cancel["destructiveHint"], True)
         self.assertIs(cancel["idempotentHint"], False)
+
+    def test_wait_seconds_schema_maximum_matches_the_actual_wait_budget(self) -> None:
+        """Finding 4: the schema used to say `minimum: 0` with no maximum,
+        and a description promising an unclamped wait, while the real
+        ceiling was silently _wait_budget(). The schema must state the
+        TRUE ceiling.
+        """
+        replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        by_name = {t["name"]: t for t in replies[1]["result"]["tools"]}
+        wait_seconds = by_name["perplexity_agent_result"]["inputSchema"]["properties"][
+            "wait_seconds"
+        ]
+        self.assertEqual(wait_seconds["maximum"], srv.WAIT_SECONDS_DEFAULT)
+        self.assertIn("clamp", wait_seconds["description"].lower())
+
+    def test_wait_seconds_schema_maximum_tracks_a_custom_wait_budget(self) -> None:
+        """Same schema field, a differently configured server: proves the
+        maximum is genuinely COMPUTED from the environment, not a number
+        that happens to equal WAIT_SECONDS_DEFAULT by coincidence — the
+        budget is itself configurable via PERPLEXITY_AGENT_WAIT_SECONDS, so
+        a hardcoded schema literal could silently drift from it.
+        """
+        replies = run_server(
+            INIT,
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            env={"PERPLEXITY_AGENT_WAIT_SECONDS": "120"},
+        )
+        by_name = {t["name"]: t for t in replies[1]["result"]["tools"]}
+        wait_seconds = by_name["perplexity_agent_result"]["inputSchema"]["properties"][
+            "wait_seconds"
+        ]
+        self.assertEqual(wait_seconds["maximum"], 120)
 
 
 class TestToolCallErrors(unittest.TestCase):
@@ -454,6 +505,57 @@ class TestToolCallErrors(unittest.TestCase):
         self.assertIs(result["isError"], True)
         self.assertIn("response_id", result["content"][0]["text"])
         self.assertNotIn("unexpectedly", result["content"][0]["text"])
+
+    def test_unknown_argument_key_is_a_tool_error(self) -> None:
+        """Finding 3: additionalProperties: false is declared in every
+        schema (see TestToolListing.test_schemas_are_well_formed) but
+        nothing enforced it before this fix — {"query": "x", "bogus":
+        "yes"} was silently accepted. Concrete harm named in review: a
+        model typing "domain" instead of "domains" got an UNFILTERED
+        search silently presented as a filtered one. No PERPLEXITY_API_KEY
+        is set: the rejection must happen before any upstream call, purely
+        from the argument shape.
+        """
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "perplexity_agent",
+                    "arguments": {"query": "x", "domain": "nasa.gov"},
+                },
+            },
+        )
+        result = replies[1]["result"]
+        self.assertNotIn("error", replies[1])
+        self.assertIs(result["isError"], True)
+        text = result["content"][0]["text"]
+        self.assertIn("domain", text, "the offending key must be named so the model self-corrects")
+        self.assertIn("domains", text, "the accepted key should be named too")
+
+    def test_unknown_argument_key_is_rejected_on_a_differently_shaped_tool_too(self) -> None:
+        """Proves the check is driven off EACH tool's own declared schema,
+        not one hardcoded key list: perplexity_agent_cancel's schema (just
+        response_id) rejects an unrelated extra key exactly like
+        perplexity_agent's does above, with no per-tool code required.
+        """
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "perplexity_agent_cancel",
+                    "arguments": {"response_id": "resp_x", "bogus": True},
+                },
+            },
+        )
+        result = replies[1]["result"]
+        self.assertIs(result["isError"], True)
+        self.assertIn("bogus", result["content"][0]["text"])
 
 
 if __name__ == "__main__":
