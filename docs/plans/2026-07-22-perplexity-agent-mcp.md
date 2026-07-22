@@ -283,8 +283,11 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "S", "RUF", "ANN"]
-# S310: urllib with a non-literal URL. We build URLs from a hardcoded constant
-# and a regex-validated id; the check cannot see that and fires anyway.
+# ANN401: we annotate `object` rather than `Any` throughout, so the few places
+# a truly dynamic type is unavoidable would otherwise need a per-line noqa.
+# S310 (urllib with a non-literal URL) and S311 (non-crypto random, used only
+# for retry jitter) are suppressed at their single call sites with noqa, so a
+# reviewer sees the justification next to the code rather than in this file.
 ignore = ["ANN401"]
 
 [tool.ruff.lint.per-file-ignores]
@@ -382,7 +385,6 @@ class FakePerplexity:
                     body = {"__unparseable__": raw.decode("utf-8", "replace")}
                 with fake._lock:
                     fake.requests.append((method, self.path, body))
-                    fake.requests[-1] += ()  # keep tuple shape explicit
                     status, payload = fake._next()
                 encoded = json.dumps(payload).encode()
                 self.send_response(status)
@@ -422,9 +424,6 @@ class FakePerplexity:
     def url(self) -> str:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
-
-    def auth_headers_seen(self) -> list[str]:
-        return []  # populated by tests that need it; see test_no_secrets
 
     def close(self) -> None:
         self._server.shutdown()
@@ -2244,14 +2243,13 @@ git commit -m "Add the three tools
 
 ---
 
-## Task 7: Secret-leak and tooling-parity guards
+## Task 7: Secret-leak guard
 
 **Files:**
 - Test: `tests/test_no_secrets.py`
-- Test: `tests/test_tooling_parity.py`
 
 **Interfaces:**
-- Consumes: the finished server (Tasks 1–6), `.pre-commit-config.yaml` and `ci.yml` (Task 8 — this test is written now and will fail until Task 8 lands, so run it after Task 8).
+- Consumes: the finished server (Tasks 1–6).
 - Produces: nothing consumed by later tasks.
 
 - [ ] **Step 1: Write the secret-leak test**
@@ -2335,7 +2333,41 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Write the tooling-parity test**
+- [ ] **Step 2: Run the secret test to verify it passes**
+
+Run: `python3.14 -m unittest tests.test_no_secrets -v`
+Expected: PASS — 3 tests.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/test_no_secrets.py
+git commit -m "Add secret-leak guard
+
+- The key must not reach stdout, stderr, or any error message even when every
+  upstream request fails; asserted against a real subprocess
+- No pplx- pattern may appear in any tracked file
+- The source must never call print(), since stdout belongs to the protocol"
+```
+
+---
+
+## Task 8: CI, pre-commit, and the tooling-parity guard
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+- Create: `.github/dependabot.yml`
+- Create: `.pre-commit-config.yaml`
+- Test: `tests/test_tooling_parity.py`
+
+**Interfaces:**
+- Consumes: all tests (Tasks 1–7).
+- Produces: green CI.
+
+The parity test is written in this task, alongside the two files it inspects, so
+it goes green in the same commit rather than sitting red across a task boundary.
+
+- [ ] **Step 0: Write the tooling-parity test**
 
 Create `tests/test_tooling_parity.py`:
 
@@ -2401,45 +2433,6 @@ class TestActionsArePinnedToShas(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 ```
-
-- [ ] **Step 3: Run the secret test to verify it passes**
-
-Run: `python3.14 -m unittest tests.test_no_secrets -v`
-Expected: PASS — 3 tests.
-
-- [ ] **Step 4: Run the parity test to confirm it fails for the right reason**
-
-Run: `python3.14 -m unittest tests.test_tooling_parity -v`
-Expected: FAIL — `FileNotFoundError` for `.pre-commit-config.yaml`. It goes green in Task 8.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add tests/test_no_secrets.py tests/test_tooling_parity.py
-git commit -m "Add secret-leak and tooling-parity guards
-
-- The key must not reach stdout, stderr, or any error message even when every
-  upstream request fails; asserted against a real subprocess
-- No pplx- pattern may appear in any tracked file
-- The source must never call print(), since stdout belongs to the protocol
-- ruff and mypy must be pinned identically in pre-commit and CI, and every
-  GitHub Action must be pinned to a 40-character SHA rather than a tag
-
-test_tooling_parity fails until CI lands in the next commit. That is the point."
-```
-
----
-
-## Task 8: CI and pre-commit
-
-**Files:**
-- Create: `.github/workflows/ci.yml`
-- Create: `.github/dependabot.yml`
-- Create: `.pre-commit-config.yaml`
-
-**Interfaces:**
-- Consumes: all tests (Tasks 1–7).
-- Produces: green CI. `tests/test_tooling_parity.py` goes green here.
 
 - [ ] **Step 1: Confirm the pinned versions and SHAs are still current**
 
@@ -2640,7 +2633,7 @@ updates:
 - [ ] **Step 5: Verify everything is green locally**
 
 Run: `python3.14 -m unittest discover -v`
-Expected: PASS — including `tests.test_tooling_parity`, which was failing before this task.
+Expected: PASS — the whole suite, including `tests.test_tooling_parity`.
 
 Run: `pre-commit install && pre-commit run --all-files`
 Expected: all hooks pass. `zizmor` in particular must report no unpinned actions.
@@ -2653,8 +2646,8 @@ ruff check . && ruff format --check . && python3.14 -m mypy --strict perplexity_
 - [ ] **Step 6: Commit**
 
 ```bash
-git add .github/workflows/ci.yml .github/dependabot.yml .pre-commit-config.yaml
-git commit -m "Add CI, pre-commit, and Dependabot
+git add .github/workflows/ci.yml .github/dependabot.yml .pre-commit-config.yaml tests/test_tooling_parity.py
+git commit -m "Add CI, pre-commit, Dependabot, and the parity guard
 
 - Matrix 3.10-3.14 running the suite with no install step, which is the product
 - Separate lint job pinning ruff and mypy to the same versions pre-commit uses
@@ -2892,6 +2885,6 @@ git commit -m "Record live verification against acceptance criteria"
 | §14 CLAUDE.md | 10 |
 | §15 acceptance criteria | 11 |
 
-**Known ordering wrinkle:** `tests/test_tooling_parity.py` is written in Task 7 and fails until Task 8 creates the files it inspects. This is deliberate and called out in both tasks — it is the plan's one red-to-green span across a task boundary.
+**Ordering:** every task ends green. `tests/test_tooling_parity.py` is created in Task 8 alongside the two files it inspects, so it never sits red across a task boundary.
 
 **Type consistency:** `_poll` returns `tuple[dict[str, object], bool]` in Tasks 4 and 6. `_progress_summary(payload, elapsed)` keeps its signature across Tasks 3, 4 and 6. `ProgressFn` is defined in Task 4 and used in Task 6. `handle_tools_list` is defined in Task 5 returning `{"tools": []}` and replaced in Task 6 — flagged explicitly in Task 5's interface block.
