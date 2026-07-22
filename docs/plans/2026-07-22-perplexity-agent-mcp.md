@@ -2684,7 +2684,11 @@ Expected: two JSON lines — an initialize result, then three tools. No third li
 
 - [ ] **Step 2: Write the README**
 
-Create `README.md` covering, in this order:
+A short placeholder `README.md` already exists — it was created in Task 1 so
+`uv build` could resolve `readme = "README.md"`. **Replace it wholesale**; none
+of its "under construction" content should survive.
+
+Cover, in this order:
 
 1. **Title, one-line description, CI badge.**
 2. **Why this exists** — the official Perplexity MCP server wraps Sonar and Search, not the Agent API. This fills that gap and runs alongside it.
@@ -2734,9 +2738,19 @@ git commit -m "Add README with both install paths and honest disclosures
 - Consumes: the finished repo.
 - Produces: nothing.
 
-- [ ] **Step 1: Write `LICENSE`**
+- [ ] **Step 1: Verify `LICENSE` (already created in Task 1)**
 
-Standard BSD-3-Clause text, `Copyright (c) 2026, Constantin Gonzalez`. Copy the canonical text from https://opensource.org/license/bsd-3-clause and substitute the copyright line — do not paraphrase licence text.
+`LICENSE` was created during Task 1's fix round to unblock `uv build`, which
+fails if `pyproject.toml` references a file that does not exist. It has been
+byte-diffed against the canonical BSD-3-Clause text and carries
+`Copyright (c) 2026, Constantin Gonzalez`.
+
+**Do not rewrite it.** Confirm it is present and unchanged, then move on:
+
+```bash
+head -3 LICENSE
+```
+Expected: `BSD 3-Clause License`, blank, `Copyright (c) 2026, Constantin Gonzalez`.
 
 - [ ] **Step 2: Write `SECURITY.md`**
 
