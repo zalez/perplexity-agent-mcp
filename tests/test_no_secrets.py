@@ -42,9 +42,9 @@ def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
     local address, and the retry backoff neutralised so all three real
     attempts complete in milliseconds instead of several real seconds.
 
-    Why a patched COPY, run as its own script, rather than the plan's
-    original `python -c "exec(open(...).read().replace(...))"` one-liner:
-    that construction depends on the exec'd code sharing the `-c` script's
+    Why a patched COPY, run as its own script, rather than a
+    `python -c "exec(open(...).read().replace(...))"` one-liner: that
+    construction depends on the exec'd code sharing the `-c` script's
     own module namespace so `__name__ == "__main__"` still holds -- true
     today, but an incidental property of how a globals-less `exec()`
     resolves, not something worth this test depending on. Writing a real
@@ -53,17 +53,16 @@ def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
     `run_server` helper), so `__name__` is "__main__" for the ordinary
     reason, and there is no shell-quoting of the repo path to get wrong.
 
-    Why _MAX_ATTEMPTS is left at its real value of 3, unpatched (an earlier
-    version of this helper trimmed it to 1 -- itself a bug, per a reviewer):
-    trimming it made _request's own retry/backoff branch --
-    `if attempt < _MAX_ATTEMPTS - 1: ...` -- structurally unreachable,
-    because with _MAX_ATTEMPTS=1 that condition is `0 < 0`, always False. A
-    leak planted inside that branch is then invisible to this test no
-    matter what it asserts, because the mutated code never runs. Left at 3,
-    attempts 0 and 1 both take that branch before the loop's third and
-    final attempt raises, so a leak planted there sits on a path this test
-    actually walks -- see the mutation evidence for Finding 1 in
-    task-7-report.md.
+    Why _MAX_ATTEMPTS is left at its real value of 3, unpatched, rather than
+    trimmed to 1 to save time: trimming it would make _request's own
+    retry/backoff branch -- `if attempt < _MAX_ATTEMPTS - 1: ...` --
+    structurally unreachable, because with _MAX_ATTEMPTS=1 that condition is
+    `0 < 0`, always False. A leak planted inside that branch would then be
+    invisible to this test no matter what it asserts, because the mutated
+    code would never run. Left at 3, attempts 0 and 1 both take that branch
+    before the loop's third and final attempt raises, so a leak planted
+    there sits on a path this test actually walks -- confirmed by planting
+    one there and watching this test catch it.
 
     What IS genuinely slow, and safe to remove, is the real
     exponential-backoff time.sleep() BETWEEN retries
@@ -85,11 +84,11 @@ def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
     )
     if patched == source:
         # Fails loudly rather than silently. A plain `assert` here would be
-        # stripped under `python -O` (Finding 4) -- turning "the patch
-        # stopped matching" into a SILENT no-op that leaves API_BASE
-        # pointed at the real Perplexity API, i.e. a live network call
-        # with a real key on every future run of this test, instead of a
-        # clean failure right now.
+        # stripped under `python -O` -- turning "the patch stopped
+        # matching" into a SILENT no-op that leaves API_BASE pointed at the
+        # real Perplexity API, i.e. a live network call with a real key on
+        # every future run of this test, instead of a clean failure right
+        # now.
         raise AssertionError("API_BASE assignment not found; server source changed shape")
 
     before_backoff = patched
@@ -105,8 +104,8 @@ def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
 def _forbidden_stdout_writes(tree: ast.AST) -> list[str]:
     """Every statically-detectable way this source could write to stdout.
 
-    Three patterns, catching the reviewer's evasions of the original
-    (name-only) check:
+    Three patterns, each catching a different way a stdout write could be
+    spelled to evade a naive name-only check:
 
     1. `print(...)` called directly, by name.
     2. `print` reached through attribute access, on ANY base expression --
@@ -237,14 +236,15 @@ class TestKeyNeverLeaks(unittest.TestCase):
 
     def test_stray_print_is_redirected_to_stderr_not_the_protocol_stream(self) -> None:
         """Pin the actual defence directly, by its runtime effect, rather
-        than relying solely on the static check above (which the Finding-2
-        mutation evidence in task-7-report.md shows an aliased call can
-        evade). Importing the real, unmodified server rebinds sys.stdout to
-        sys.stderr as an import side effect -- see the "stdout discipline"
-        comment at the top of perplexity_agent_mcp.py -- so any print()
-        call anywhere in the process, after that import, lands on stderr
-        no matter how it was written or where it came from, aliased or
-        not.
+        than relying solely on the static check above, which an aliased
+        call (`p = print; p(...)`) can evade -- see
+        _forbidden_stdout_writes's own docstring for why that gap can never
+        close statically. Importing the real, unmodified server rebinds
+        sys.stdout to sys.stderr as an import side effect -- see the
+        "stdout discipline" comment at the top of perplexity_agent_mcp.py
+        -- so any print() call anywhere in the process, after that import,
+        lands on stderr no matter how it was written or where it came
+        from, aliased or not.
 
         Drives a tiny driver script in a real subprocess: import the real
         module (runs the rebind), call print() ourselves to stand in for
@@ -286,15 +286,15 @@ class TestKeyNeverLeaks(unittest.TestCase):
 
 
 class TestKeyStaysOutOfUpstreamRequests(unittest.TestCase):
-    """Finding 3: a reviewer planted the key into _request's own `url`
-    construction, and every test in TestKeyNeverLeaks above passed --
-    none of them inspects what actually went out over the wire (property 1
-    never completes a real connection at all; properties 2 and 3 only ever
-    look at source text). The only thing that caught it was three
-    unrelated exact-path assertions in test_perplexity_client.py
-    (TestSubmit/TestPoll/TestCancel), protection that would silently
-    vanish the moment any one of those assertions was loosened for an
-    unrelated reason.
+    """None of TestKeyNeverLeaks above inspects what actually goes out over
+    the wire: its process-level property never completes a real connection
+    at all, and its source-level properties only ever look at source text.
+    A key planted into `_request`'s own `url` construction, for instance,
+    would pass every one of those tests untouched -- the only thing that
+    would catch it is incidental: three unrelated exact-path assertions in
+    test_perplexity_client.py (TestSubmit/TestPoll/TestCancel), protection
+    that would silently vanish the moment any one of those assertions was
+    loosened for an unrelated reason.
 
     This class owns the property directly: drive real submit/poll/cancel
     calls against the in-process fake upstream, then inspect exactly what

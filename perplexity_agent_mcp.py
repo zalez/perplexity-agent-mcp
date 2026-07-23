@@ -58,12 +58,10 @@ from typing import TextIO
 # So: grab the real stdout, then point sys.stdout at stderr. After this, any
 # accidental print() anywhere in the process is harmless noise on stderr.
 #
-# This sits after the import block rather than textually right after the
-# version guard (as originally sketched) because the imports Task 2 placed
-# between them are themselves after the guard already, and a plain (non-dunder)
-# assignment ahead of an import block trips ruff's E402 — see the commit
-# message for the full reasoning. It still runs before __version__ is even
-# defined, i.e. before any of this module's own code could possibly print.
+# This sits after the import block, not immediately after the version guard,
+# because a plain (non-dunder) assignment ahead of an import block trips
+# ruff's E402 lint rule. It still runs before __version__ is even defined,
+# i.e. before any of this module's own code could possibly print.
 _STDOUT = sys.stdout
 _STDERR = sys.stderr
 sys.stdout = sys.stderr
@@ -181,8 +179,8 @@ class PerplexityError(Exception):
     summarize more than one attempt, of possibly different failure types,
     so no single status would be honest to report). Exists so a caller can
     make status-CODED decisions — e.g. tool_cancel's "already terminal"
-    check (Finding 1) — without parsing upstream prose Perplexity never
-    promises to keep stable; only the 400 status itself is documented.
+    check — without parsing upstream prose Perplexity never promises to
+    keep stable; only the 400 status itself is documented.
     """
 
     def __init__(self, message: str, status: int | None = None) -> None:
@@ -278,21 +276,17 @@ def _request(
     attached to an exception, never logged, and never returned.
 
     `deadline`, when given, is a `time.monotonic()` timestamp this call must
-    not run past. It exists for one reason: Claude Desktop enforces a 60s
-    tool-call timeout its users cannot change — exactly why
-    WAIT_SECONDS_DEFAULT is 55, not something rounder. Without a deadline,
-    this function's OWN retry loop can burn far more time than any caller's
-    budget on its own — up to roughly `_MAX_ATTEMPTS * _SOCKET_TIMEOUT` plus
-    backoff, ~90s worst case — because `_poll`'s elapsed-time check only
-    runs BETWEEN calls to this function, never during one already in
-    flight. `deadline` closes that gap from the inside: it shortens the
-    per-attempt socket timeout to whatever time genuinely remains (floored
-    at 1s — see the comment below on why attempt 0 always gets that much),
-    and it stops the retry loop before a backoff sleep would carry past the
-    deadline, rather than after. `_submit` and `_cancel` call this with no
-    deadline and are unaffected — every deadline-driven branch below only
-    ever SHORTENS a timeout or a retry, never lengthens one, so `deadline
-    is None` reproduces the old, unbounded behaviour exactly.
+    not run past — Claude Desktop enforces a 60s tool-call timeout its users
+    cannot change (why WAIT_SECONDS_DEFAULT is 55, not something rounder),
+    and without a deadline this function's OWN retry loop can burn far more
+    than that on its own: up to `_MAX_ATTEMPTS * _SOCKET_TIMEOUT` plus
+    backoff, ~90s worst case, since `_poll`'s elapsed-time check only runs
+    BETWEEN calls to this function, never during one already in flight.
+    `deadline` shortens the per-attempt socket timeout to whatever time
+    genuinely remains (floored at 1s — see below) and stops the retry loop
+    before a backoff sleep would carry past it, rather than after.
+    `deadline is None` reproduces the old, unbounded behaviour exactly, so
+    `_submit` and `_cancel`'s no-deadline calls are unaffected.
     """
     url = API_BASE + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -302,16 +296,13 @@ def _request(
         timeout = _SOCKET_TIMEOUT
         if deadline is not None:
             # Floored at 1s rather than refused outright when already zero
-            # or negative. Two reasons: a sub-second timeout isn't useful —
-            # it would fire on ordinary latency, not just a genuinely stuck
-            # connection — and _poll deliberately times its LAST call to
-            # land right at this exact edge (see _poll's "don't overshoot
-            # the budget just to complete a sleep"), so refusing attempt 0
+            # or negative: a sub-second timeout would fire on ordinary
+            # latency, not just a stuck connection, and _poll deliberately
+            # times its LAST call to land right at this exact edge (see
+            # _poll's "don't overshoot the budget"), so refusing attempt 0
             # here would turn every graceful budget-expiry return in _poll
-            # into a raised exception instead. The bounded (<=1s) worst
-            # case this floor accepts is the trade-off; the backoff check
-            # below is where a deadline that is ACTUALLY exhausted stops
-            # this loop from retrying — see there for why that is enough.
+            # into a raised exception instead. The backoff check below is
+            # what stops a genuinely exhausted deadline from retrying.
             timeout = min(_SOCKET_TIMEOUT, max(1.0, deadline - time.monotonic()))
 
         request = urllib.request.Request(url, data=data, method=method)  # noqa: S310
@@ -333,15 +324,14 @@ def _request(
             with exc:
                 payload = _safe_json(_read_capped(exc.read, _MAX_RESPONSE_BYTES))
                 if 300 <= exc.code < 400:
-                    # _NoRedirectHandler turned what would otherwise have
-                    # been a followed redirect into this HTTPError, carrying
-                    # the ORIGINAL 3xx status untouched (see _OPENER's
-                    # comment for why one is refused at all). Say so
-                    # plainly instead of falling through to
-                    # _error_message's generic "Perplexity returned HTTP
-                    # {status}." — a bare status code there would read as
-                    # an ordinary upstream error, not the deliberate
-                    # refusal this actually is.
+                    # _NoRedirectHandler turned the followed redirect into
+                    # this HTTPError, carrying the ORIGINAL 3xx status
+                    # untouched (see _OPENER's comment for why one is
+                    # refused at all). State that plainly rather than
+                    # falling through to _error_message's generic
+                    # "Perplexity returned HTTP {status}.", which would read
+                    # as an ordinary upstream error, not the deliberate
+                    # refusal this is.
                     message = (
                         f"Perplexity returned an HTTP {exc.code} redirect, which this "
                         "server refuses to follow."
@@ -351,8 +341,8 @@ def _request(
                 if exc.code not in _RETRY_STATUSES:
                     # A bad request retried is just a slower bad request.
                     # status=exc.code is what lets tool_cancel key its
-                    # "already terminal" check on the STATUS (Finding 1)
-                    # instead of sniffing this message's prose.
+                    # "already terminal" check on the STATUS instead of
+                    # sniffing this message's prose.
                     raise PerplexityError(message, status=exc.code) from None
                 last_error = message
         except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
@@ -366,13 +356,11 @@ def _request(
             backoff = 2**attempt + random.random()  # noqa: S311
             if deadline is not None and time.monotonic() + backoff >= deadline:
                 # Sleeping the full backoff would carry past the deadline.
-                # This is also what catches a deadline that had ALREADY
-                # passed before this call even started: attempt 0 above
-                # still got its one bounded try (see its comment), but a
-                # SECOND attempt on top of a budget that was already spent
-                # is exactly the unbounded-retry problem `deadline` exists
-                # to prevent. Give up now instead of sleeping and retrying
-                # anyway.
+                # This also catches a deadline that had ALREADY passed
+                # before this call started: attempt 0 still got its one
+                # bounded try (see its comment above), but a SECOND attempt
+                # on an already-spent budget is exactly the unbounded-retry
+                # problem `deadline` exists to prevent.
                 raise PerplexityError(f"{last_error} (deadline exceeded)")
             time.sleep(backoff)
 
@@ -443,6 +431,10 @@ def _extract_answer(payload: dict[str, object]) -> str:
     convenience property on Perplexity's own SDKs. This is what those SDKs do
     internally, and getting it wrong is the single easiest way to ship a server
     that returns empty answers.
+
+    Truncated via `_truncate`, not a bare slice: a silently chopped answer
+    would reach the model with no marker at all, the exact failure `_truncate`
+    itself exists to prevent everywhere else this module echoes upstream text.
     """
     parts: list[str] = []
     for message in _items(payload, "message"):
@@ -454,7 +446,7 @@ def _extract_answer(payload: dict[str, object]) -> str:
                 text = part.get("text")
                 if isinstance(text, str):
                     parts.append(text)
-    return "".join(parts)[:_MAX_ANSWER_CHARS]
+    return _truncate("".join(parts), _MAX_ANSWER_CHARS)
 
 
 def _extract_sources(payload: dict[str, object]) -> list[dict[str, str]]:
@@ -570,10 +562,10 @@ def _format_answer(payload: dict[str, object]) -> str:
 
 # (message, progress) -> None. `progress` MUST increase with every call for
 # a given token, per the MCP progress utility spec, even when there is no
-# known total (Finding 7). `_poll` below is the only caller that ever
-# invokes this, and always passes its own elapsed-seconds clock, which
-# increases by construction across polls — each is separated by a real
-# network round trip plus a sleep (see _poll's loop).
+# known total. `_poll` below is the only caller that ever invokes this, and
+# always passes its own elapsed-seconds clock, which increases by
+# construction across polls — each is separated by a real network round
+# trip plus a sleep (see _poll's loop).
 ProgressFn = Callable[[str, float], None]
 
 # Statuses from which a run will never move again.
@@ -729,23 +721,19 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
-# A generous cap on a single incoming request line, enforced by serve() below.
-# BAND 2's _MAX_RESPONSE_BYTES bounds a response from Perplexity: a remote
-# peer reached over the open internet, where "generous but bounded" is a real
-# security boundary against a hostile or compromised server. This constant
-# bounds the opposite direction — a request line from the LOCAL MCP client —
-# which is a fundamentally different trust boundary: the operator controls
-# both ends of that pipe (their own client, e.g. Claude Desktop or Claude
-# Code, talking to their own copy of this server they just audited). So this
-# cap is hardening against a runaway or buggy client, not a defense against a
-# hostile one. That is also why it can be smaller than BAND 2's 32 MiB: every
-# legitimate request this server accepts — a query string, a preset, an
-# optional recency filter or domain list, a response_id — is structurally
-# tiny next to a fetched research answer carrying up to 50 sources. The unit
-# here is CHARACTERS, not bytes: serve() reads through a TextIO already
-# decoded from UTF-8, so bytes are simply not the currency available at this
-# layer (see serve()'s docstring for how the cap is enforced without ever
-# materialising an oversized line in memory first).
+# A generous cap on a single incoming request line, enforced by serve()
+# below. BAND 2's _MAX_RESPONSE_BYTES bounds a different trust boundary — a
+# remote peer over the open internet — where "generous but bounded" is a
+# real defense against a hostile or compromised server. This constant
+# bounds the LOCAL MCP client instead: the operator controls both ends of
+# that pipe (their own client talking to their own copy of this server they
+# just audited), so it is hardening against a runaway or buggy client, not
+# a hostile one. That is also why it can be smaller than BAND 2's 32 MiB:
+# every legitimate request this server accepts — a query string, a preset,
+# a response_id — is structurally tiny next to a fetched research answer.
+# The unit is CHARACTERS, not bytes, because serve() reads through a TextIO
+# already decoded from UTF-8 (see its docstring for how the cap is enforced
+# without ever materialising an oversized line in memory first).
 _MAX_LINE_CHARS = 8 * 1024 * 1024
 
 
@@ -792,8 +780,8 @@ def handle_ping(params: dict[str, object]) -> dict[str, object]:
 
 _RECENCY_VALUES = frozenset({"hour", "day", "week", "month", "year"})
 _MAX_DOMAINS = 20
-# The wait_seconds schema's advertised ceiling (Finding 4). Computed once
-# at import time — accurate for this process's whole lifetime, since an MCP
+# The wait_seconds schema's advertised ceiling. Computed once at import
+# time — accurate for this process's whole lifetime, since an MCP
 # server's env is set once, by the client's "env" block, before this module
 # is ever imported — rather than a fixed literal that could drift from what
 # _wait_budget() actually enforces once PERPLEXITY_AGENT_WAIT_SECONDS is
@@ -839,14 +827,14 @@ def _optional_domains(args: dict[str, object]) -> list[str] | None:
 
 def _with_default(args: dict[str, object], name: str, default: object) -> object:
     """Fetch an optional argument, treating an explicit `null` exactly like
-    an absent key (Finding 6): models emit `null` for optional arguments
-    routinely, and `recency`/`domains` above already tolerate it (a bare
-    `args.get(name)` returns `None` either way) — `preset`, `wait`, and
-    `wait_seconds` did not, because `dict.get(name, default)` only supplies
-    `default` when the KEY is missing, not when it is present and `None`.
-    `query` and `response_id` are required, have no default to fall back
-    to, and correctly keep rejecting `None` via `_require_str` instead —
-    this helper is only for arguments that have one.
+    an absent key: models emit `null` for optional arguments routinely, and
+    `recency`/`domains` above already tolerate it (a bare `args.get(name)`
+    returns `None` either way) — `preset`, `wait`, and `wait_seconds` did
+    not, because `dict.get(name, default)` only supplies `default` when the
+    KEY is missing, not when it is present and `None`. `query` and
+    `response_id` are required, have no default to fall back to, and
+    correctly keep rejecting `None` via `_require_str` instead — this
+    helper is only for arguments that have one.
     """
     value = args.get(name, default)
     return default if value is None else value
@@ -861,10 +849,10 @@ def _terminal_or_raise(payload: dict[str, object]) -> str:
         if isinstance(error, dict):
             message = error.get("message")
             if isinstance(message, str):
-                # Same defensive bound as _error_message's HTTP-error path
-                # (Finding 5): a failed run's error.message was the one
-                # echoed upstream string in this module with no length cap
-                # at all — everything else BAND 3 echoes already gets one.
+                # Same defensive bound as _error_message's HTTP-error path:
+                # a failed run's error.message is an echoed upstream string
+                # like every other value BAND 3 echoes, so it gets the same
+                # cap rather than passing through unbounded.
                 detail = f": {_truncate(message, _MAX_ERROR_CHARS)}"
         raise PerplexityError(f"The research run failed{detail}")
     if status == "cancelled":
@@ -895,14 +883,14 @@ def tool_agent(args: dict[str, object], notify: ProgressFn | None) -> str:
     if not isinstance(wait, bool):
         raise ToolInputError("'wait' must be a boolean.")
 
-    # ONE deadline for the WHOLE tool call, not just the poll phase. Carried
-    # forward from Task 4/5's review: without this, _submit's own retry loop
-    # (inside _request, up to roughly 90s worst case — see its docstring)
-    # runs to completion BEFORE _poll even starts, and a _poll then handed a
-    # fresh full _wait_budget() on top means the two calls' worst cases
-    # simply add. WAIT_SECONDS_DEFAULT is 55, not something rounder,
-    # precisely because Claude Desktop enforces an unconfigurable 60s
-    # tool-call timeout — that ceiling has to bound this entire function.
+    # ONE deadline for the WHOLE tool call, not just the poll phase. Without
+    # this, _submit's own retry loop (inside _request, up to roughly 90s
+    # worst case — see its docstring) runs to completion BEFORE _poll even
+    # starts, and a _poll then handed a fresh full _wait_budget() on top
+    # means the two calls' worst cases simply add. WAIT_SECONDS_DEFAULT is
+    # 55, not something rounder, precisely because Claude Desktop enforces
+    # an unconfigurable 60s tool-call timeout — that ceiling has to bound
+    # this entire function.
     started = time.monotonic()
     deadline = started + _wait_budget()
 
@@ -939,46 +927,35 @@ def tool_result(args: dict[str, object], notify: ProgressFn | None) -> str:
 
 def tool_cancel(args: dict[str, object], notify: ProgressFn | None) -> str:
     response_id = _require_str(args, "response_id")
-    # Same end-to-end budgeting as tool_agent above: left unbounded, _cancel's
-    # own call through _request could retry for up to ~90s on its own (see
-    # _request's docstring), with nothing tying it to the 55s ceiling Claude
-    # Desktop's unconfigurable tool-call timeout requires.
+    # Same end-to-end deadline as tool_agent, for the same reason: bound
+    # _cancel's own retry loop to the 55s/60s ceiling (see _request).
     deadline = time.monotonic() + _wait_budget()
     try:
         return _cancel(response_id, deadline=deadline)
     except PerplexityError as exc:
-        # Finding 1: key on the upstream STATUS, never on message prose.
-        # Perplexity's docs pin 400 for "already terminal"; they never pin
-        # the wording. Sniffing the message text was a real, dangerous bug:
-        # this module's OWN fallback for a 400 with no body ("Perplexity
-        # returned HTTP 400.") contains neither "already" nor "terminal" and
-        # so wrongly RAISED, while an unrelated 401 body that merely
-        # happened to contain the word "already" (e.g. "Your API key has
-        # already been revoked") wrongly matched and was reported BENIGN —
-        # telling the calling model a state-changing call had succeeded
-        # when it had not even authenticated. `status` is unambiguous: it
-        # is set only when `_request` raised directly from an HTTPError
-        # response, never for a network failure (which correctly keeps
-        # raising below, since `exc.status` stays `None`).
+        # Key on the upstream STATUS, never on message prose: Perplexity
+        # pins 400 for "already terminal" but never pins the wording. A
+        # text match on the message is dangerous in both directions —
+        # this module's own no-body fallback for a 400 ("Perplexity
+        # returned HTTP 400.") contains neither "already" nor "terminal",
+        # so it would wrongly raise, while a 401 body that merely happens
+        # to contain "already" (e.g. "Your API key has already been
+        # revoked") would wrongly match and report a failed, unauthenticated
+        # call as benign. `status` is set only from an HTTPError response,
+        # so a network failure still raises below (`exc.status` is `None`).
         if exc.status == 400:
-            # Live-verification finding, 2026-07-23: Perplexity's docs say an
-            # unknown or cross-tenant response_id surfaces as 404. It does
-            # not. Probed live with a well-formed but never-issued UUID
-            # (resp_00000000-0000-0000-0000-000000000000) and a short
-            # nonsense id (resp_deadbeef) — both returned 400 with the exact
-            # body a genuinely-terminal run also returns: {"error":
-            # {"message": "the run is already terminal and cannot be
-            # cancelled", "type": "invalid_request", "code": 400}}. Nothing
-            # in the response distinguishes "already terminal" from "never
-            # existed", so this is not a parsing gap to close by reading the
-            # payload harder — there is no signal in it to read. Do not add
-            # a pre-flight existence check either: that is an extra
-            # billable round trip on this tool's own hot path and would
-            # still be racy against the run finishing between the check and
-            # the cancel itself. The wording below is chosen to stay true
-            # under EITHER cause: it asserts only what holds for both (the
-            # id is not an active run right now) and defers to
-            # perplexity_agent_result rather than guessing further.
+            # Perplexity's docs say an unknown or cross-tenant response_id
+            # surfaces as 404; live probing (a well-formed but never-issued
+            # UUID, and a short nonsense id) shows it does not — both
+            # return the identical 400 body a genuinely-terminal run also
+            # returns: {"error": {"message": "the run is already terminal
+            # and cannot be cancelled", ...}}. Nothing in the response
+            # distinguishes "already terminal" from "never existed", so
+            # there is no payload signal to parse harder for. A pre-flight
+            # existence check would just add a billable round trip that is
+            # still racy against the run finishing in between. The wording
+            # below asserts only what holds under both causes, and defers
+            # to perplexity_agent_result rather than guessing further.
             return (
                 f"Run {response_id} is not running now — Perplexity returns this "
                 "same response whether the run already finished or the id never "
@@ -1039,18 +1016,17 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
             "additionalProperties": False,
         },
         "annotations": {
-            # OWNER DECISION (Finding 8): be honest rather than convenient.
-            # This tool creates durable, billable, cancellable upstream
-            # state — the very state perplexity_agent_cancel's own
-            # destructiveHint: True below exists to remove — so
-            # readOnlyHint: True was simply untrue, and clients use
-            # readOnlyHint to decide whether a call needs the user's
-            # approval before running. destructiveHint is spelled out as
-            # False explicitly, rather than left to its default, because
-            # the MCP spec defaults destructiveHint to TRUE once
-            # readOnlyHint is False, and this tool destroys nothing —
-            # leaving it implicit would silently claim the opposite of
-            # what is true.
+            # Honest rather than convenient. This tool creates durable,
+            # billable, cancellable upstream state — the very state
+            # perplexity_agent_cancel's own destructiveHint: True below
+            # exists to remove — so readOnlyHint: True would simply be
+            # untrue, and clients use readOnlyHint to decide whether a call
+            # needs the user's approval before running. destructiveHint is
+            # spelled out as False explicitly, rather than left to its
+            # default, because the MCP spec defaults destructiveHint to
+            # TRUE once readOnlyHint is False, and this tool destroys
+            # nothing — leaving it implicit would silently claim the
+            # opposite of what is true.
             "readOnlyHint": False,
             "destructiveHint": False,
             "idempotentHint": False,
@@ -1125,9 +1101,9 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
 
 def _schemas_by_name(schemas: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     """name -> full schema, so handle_tools_call can enforce each tool's own
-    additionalProperties: false (Finding 3) off the SAME data tools/list
-    already returns, rather than a second, hand-maintained key list that
-    could drift from it.
+    additionalProperties: false off the SAME data tools/list already
+    returns, rather than a second, hand-maintained key list that could
+    drift from it.
     """
     by_name: dict[str, dict[str, object]] = {}
     for schema in schemas:
@@ -1152,11 +1128,10 @@ def handle_tools_list(params: dict[str, object]) -> dict[str, object]:
 
 def _reject_unknown_arguments(schema: dict[str, object], args: dict[str, object]) -> None:
     """Enforce the additionalProperties: false every TOOL_SCHEMAS entry
-    already declares but nothing previously checked (Finding 3):
-    {"query": "x", "bogus": "yes"} used to be silently accepted. Driven off
-    the tool's OWN declared schema, not a hardcoded key list per tool, so
-    the schema stays the single source of truth. Concrete harm this
-    prevents: a model that types "domain" instead of "domains" now gets an
+    declares: {"query": "x", "bogus": "yes"} must not be silently accepted.
+    Driven off the tool's OWN declared schema, not a hardcoded key list per
+    tool, so the schema stays the single source of truth. Concrete harm
+    this prevents: a model that types "domain" instead of "domains" gets an
     actionable error naming both the bad key and the accepted ones, rather
     than an UNFILTERED search silently presented as a filtered one.
     """
@@ -1246,9 +1221,8 @@ def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
                     # MUST increase with every notification for this token
                     # (MCP spec, Utilities/Progress), even with no known
                     # total. Forwarding _poll's own elapsed-seconds clock
-                    # satisfies that for free (Finding 7): it increases by
-                    # construction, so this closure needs no counter state
-                    # of its own — this previously hardcoded 0 instead.
+                    # satisfies that for free: it increases by construction,
+                    # so this closure needs no counter state of its own.
                     "progress": progress,
                     "message": message,
                     # `total` is deliberately never sent: a research run's
@@ -1334,40 +1308,35 @@ def _drain_line(stdin: TextIO) -> None:
             return
 
 
-def serve(stdin: TextIO, stdout: TextIO) -> int:
-    """Read newline-delimited JSON-RPC until EOF.
+def serve(stdin: TextIO) -> int:
+    """Read newline-delimited JSON-RPC until EOF, writing replies to _STDOUT.
 
     The read loop must never die — that is the one hard requirement this
     function exists to satisfy, and three distinct failure modes threaten it:
 
     1. A line that parses as JSON but nests deep enough raises RecursionError,
-       not json.JSONDecodeError. CPython's C-accelerated decoder recurses one
-       stack frame per nesting level and guards its own C stack directly, so
-       a several-hundred-thousand-deep array overflows that guard rather than
-       producing an ordinary decode error. Caught alongside JSONDecodeError.
+       not json.JSONDecodeError: CPython's C-accelerated decoder recurses one
+       stack frame per nesting level and overflows its own C stack guard
+       before it can produce an ordinary decode error. Caught alongside
+       JSONDecodeError.
     2. A line containing bytes that are not valid UTF-8 would otherwise raise
-       UnicodeDecodeError from INSIDE this stream's own text decoding —
+       UnicodeDecodeError from inside this stream's own text decoding,
        outside any try/except this function could wrap around json.loads.
-       Handled upstream, in main(): reconfiguring stdin's error handler to
-       "replace" means undecodable bytes have already become U+FFFD by the
-       time any line reaches here, so decoding itself can no longer raise —
-       the resulting text then fails json.loads cleanly (or doesn't) like any
-       other malformed input.
+       Handled upstream in main(): reconfiguring stdin's error handler to
+       "replace" turns undecodable bytes into U+FFFD before a line ever
+       reaches here, so decoding itself can no longer raise.
     3. A single line with no newline could otherwise grow this process's
-       memory without bound before a delimiter ever arrived to act on.
-       `for line in stdin:` cannot express a cap here: it fully materialises
-       one line before ever handing it to this function's body. Reading via
-       readline(_MAX_LINE_CHARS + 1) instead does: readline(n) stops at n
-       characters OR a newline, whichever comes first, so a result that is
-       exactly _MAX_LINE_CHARS + 1 characters long AND does not end in a
-       newline can only mean the real line is longer than we allow — and we
-       know that without ever holding more than that one bounded chunk. On
-       overflow we drain and discard the remainder (see _drain_line) rather
-       than silently truncating, which would just turn one oversized message
-       into a confusing parse error further down, and report it with -32600:
-       the same code already used for "syntactically-parseable JSON we still
-       won't accept" (see the array check below) — an oversized line is that
-       same category, we just never get far enough to see the JSON.
+       memory without bound. `for line in stdin:` can't express a cap — it
+       fully materialises one line before handing it to this function's
+       body — so we read via readline(_MAX_LINE_CHARS + 1) instead:
+       readline(n) stops at n characters OR a newline, whichever comes
+       first, so a result longer than _MAX_LINE_CHARS that doesn't end in a
+       newline proves the real line is longer than we allow, without ever
+       holding more than that one bounded chunk. On overflow we drain and
+       discard the remainder (see _drain_line) rather than truncating
+       silently, and report -32600 — the same code already used for
+       "syntactically-parseable JSON we still won't accept" below, since an
+       oversized line is that same category.
     """
     while True:
         chunk = stdin.readline(_MAX_LINE_CHARS + 1)
@@ -1377,7 +1346,7 @@ def serve(stdin: TextIO, stdout: TextIO) -> int:
         if len(chunk) > _MAX_LINE_CHARS and not chunk.endswith("\n"):
             _drain_line(stdin)
             _write(
-                stdout,
+                _STDOUT,
                 _error(
                     None,
                     INVALID_REQUEST,
@@ -1393,18 +1362,18 @@ def serve(stdin: TextIO, stdout: TextIO) -> int:
         try:
             message = json.loads(line)
         except (json.JSONDecodeError, RecursionError):
-            _write(stdout, _error(None, PARSE_ERROR, "Parse error."))
+            _write(_STDOUT, _error(None, PARSE_ERROR, "Parse error."))
             continue
 
         if not isinstance(message, dict):
             # JSON-RPC batching was removed from MCP in 2025-06-18, so an array
             # is no longer a valid message.
-            _write(stdout, _error(None, INVALID_REQUEST, "Invalid request."))
+            _write(_STDOUT, _error(None, INVALID_REQUEST, "Invalid request."))
             continue
 
         reply = dispatch(message)
         if reply is not None:
-            _write(stdout, reply)
+            _write(_STDOUT, reply)
 
     return 0
 
@@ -1441,7 +1410,7 @@ def main() -> int:
     """
     if isinstance(sys.stdin, io.TextIOWrapper):
         sys.stdin.reconfigure(errors="replace")
-    return serve(sys.stdin, _STDOUT)
+    return serve(sys.stdin)
 
 
 if __name__ == "__main__":

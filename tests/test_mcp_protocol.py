@@ -111,14 +111,15 @@ class TestNotifications(unittest.TestCase):
         self.assertEqual(len(replies), 1, "notifications must never be answered")
 
     def test_notification_status_is_id_absence_not_method_naming(self) -> None:
-        """Not in the brief verbatim — added because the brief's own prose flags this
-        exact confusion ("detect by absent `id`, not by a `notifications/` prefix")
-        and the given suite doesn't actually discriminate the two implementations:
-        a detector keyed on method-prefix instead of `id`-absence passes all 14
-        brief tests unchanged (verified by mutation before adding this).
+        """A notification is defined by the ABSENCE of `id`, per JSON-RPC 2.0
+        and the MCP spec — not by a `notifications/`-prefixed method name. A
+        detector keyed on the method prefix instead would pass every other
+        test in this file unchanged (confirmed by mutation), since none of
+        them sends a non-"notifications/" method with no `id`.
 
-        A message with a real, registered method (`ping`) but no `id` must still
-        get no reply — nothing about "notifications/" naming is involved.
+        A message with a real, registered method (`ping`) but no `id` must
+        still get no reply — nothing about "notifications/" naming is
+        involved.
         """
         replies = run_server(INIT, {"jsonrpc": "2.0", "method": "ping"})
         self.assertEqual(len(replies), 1, "id-less messages are notifications, whatever their name")
@@ -198,20 +199,20 @@ class TestTransport(unittest.TestCase):
 
 
 class TestReadLoopSurvival(unittest.TestCase):
-    """Each of these reproduces one of three review findings: a way the read
-    loop could die. The assertion that matters most in every case is the
-    LAST one -- that a well-formed request sent right after the bad input is
-    still answered -- since that's what proves the loop survived, not merely
-    that one error frame happened to look right.
+    """Each of these reproduces one way the read loop could die. The
+    assertion that matters most in every case is the LAST one -- that a
+    well-formed request sent right after the bad input is still answered --
+    since that's what proves the loop survived, not merely that one error
+    frame happened to look right.
     """
 
     def test_deeply_nested_array_yields_parse_error_and_loop_survives(self) -> None:
-        """Finding 1: CPython's C-accelerated json.loads raises
-        RecursionError, not json.JSONDecodeError, on sufficiently deep
-        nesting. Uncaught, this killed the process outright: exit code 1, a
-        bare traceback on stderr, zero stdout lines -- a ping sent right
-        after never got answered. 500,000 levels reproduces it in well under
-        a second, generated in memory; no on-disk fixture needed.
+        """CPython's C-accelerated json.loads raises RecursionError, not
+        json.JSONDecodeError, on sufficiently deep nesting. Left uncaught,
+        this would kill the process outright: exit code 1, a bare traceback
+        on stderr, zero stdout lines -- a ping sent right after would never
+        get answered. 500,000 levels reproduces it in well under a second,
+        generated in memory; no on-disk fixture needed.
         """
         deeply_nested = "[" * 500_000 + "]" * 500_000
         stdin = f'{deeply_nested}\n{{"jsonrpc":"2.0","id":9,"method":"ping"}}\n'
@@ -230,13 +231,16 @@ class TestReadLoopSurvival(unittest.TestCase):
         self.assertEqual(replies[-1], {"jsonrpc": "2.0", "id": 9, "result": {}})
 
     def test_invalid_utf8_yields_error_and_loop_survives_under_strict_decoding(self) -> None:
-        """Finding 2: `for line in stdin:` decodes UTF-8 itself, outside any
-        try/except. It survived on a default install only because Python's
-        UTF-8 mode currently defaults stdin to errors="surrogateescape" -- an
-        environment default, not a guarantee. PYTHONIOENCODING=utf-8:strict
-        (set explicitly below -- a legitimate, unexotic configuration)
-        reproducibly turned the same input into an uncaught
-        UnicodeDecodeError before this fix: exit code 1, zero stdout lines.
+        """`for line in stdin:` decodes UTF-8 itself, outside any try/except
+        this module could wrap around json.loads. Relying on that alone
+        would only survive by accident of Python's UTF-8 mode currently
+        defaulting stdin to errors="surrogateescape" -- an environment
+        default, not a guarantee. PYTHONIOENCODING=utf-8:strict (set
+        explicitly below -- a legitimate, unexotic configuration) is enough
+        to turn the same input into an uncaught UnicodeDecodeError under
+        that naive approach: exit code 1, zero stdout lines. main()'s
+        explicit stdin.reconfigure(errors="replace") is what keeps this
+        deterministic regardless of the ambient default.
 
         The garbage line is invalid UTF-8 standing alone, not embedded inside
         an otherwise-valid JSON string, so once errors="replace" turns it
@@ -283,13 +287,13 @@ class TestReadLoopSurvival(unittest.TestCase):
         self.assertEqual(replies[-1], {"jsonrpc": "2.0", "id": 9, "result": {}})
 
     def test_oversized_line_yields_error_and_loop_survives(self) -> None:
-        """Finding 3: no bound existed on a single incoming line, unlike
-        BAND 2's _MAX_RESPONSE_BYTES for HTTP responses. This is hardening,
-        not a crash reproduction -- "before" is simply the absence of any
-        cap, so this test only characterises "after": the cap fires at
-        _MAX_LINE_CHARS + 1 characters, the rest of the line is drained
-        rather than left to desynchronise the stream, and the next line is
-        still answered.
+        """A single incoming line needs its own bound, distinct from BAND
+        2's _MAX_RESPONSE_BYTES for HTTP responses -- an unbounded line
+        could otherwise grow this process's memory without limit. This is
+        hardening, not a crash reproduction, so this test only characterises
+        the guarded behaviour: the cap fires at _MAX_LINE_CHARS + 1
+        characters, the rest of the line is drained rather than left to
+        desynchronise the stream, and the next line is still answered.
         """
         oversized = "x" * (srv._MAX_LINE_CHARS + 1)
         stdin = f'{oversized}\n{{"jsonrpc":"2.0","id":9,"method":"ping"}}\n'
@@ -368,15 +372,15 @@ class TestToolListing(unittest.TestCase):
                 self.assertIs(tool["inputSchema"]["additionalProperties"], False)
 
     def test_annotations_are_honest(self) -> None:
-        """OWNER DECISION (Finding 8): be honest rather than convenient.
-        perplexity_agent creates durable, billable, cancellable upstream
-        state, so it is NOT read-only — clients use readOnlyHint to decide
-        whether a call needs the user's approval, and claiming read-only
-        would be false. destructiveHint is explicitly False (it defaults
-        to True once readOnlyHint is False) because this tool destroys
-        nothing. perplexity_agent_result genuinely only reads, so it keeps
-        readOnlyHint: true. perplexity_agent_cancel is unchanged: it
-        changes upstream state and is not idempotent.
+        """Honest annotations over convenient ones. perplexity_agent creates
+        durable, billable, cancellable upstream state, so it is NOT
+        read-only — clients use readOnlyHint to decide whether a call needs
+        the user's approval, and claiming read-only would be false.
+        destructiveHint is explicitly False (it defaults to True once
+        readOnlyHint is False) because this tool destroys nothing.
+        perplexity_agent_result genuinely only reads, so it keeps
+        readOnlyHint: true. perplexity_agent_cancel changes upstream state
+        and is not idempotent, so both hints say so.
         """
         replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         by_name = {t["name"]: t for t in replies[1]["result"]["tools"]}
@@ -397,10 +401,10 @@ class TestToolListing(unittest.TestCase):
         self.assertIs(cancel["idempotentHint"], False)
 
     def test_wait_seconds_schema_maximum_matches_the_actual_wait_budget(self) -> None:
-        """Finding 4: the schema used to say `minimum: 0` with no maximum,
-        and a description promising an unclamped wait, while the real
-        ceiling was silently _wait_budget(). The schema must state the
-        TRUE ceiling.
+        """The schema must state the TRUE ceiling: a `maximum` that matches
+        what `_wait_budget()` actually enforces, not just a `minimum: 0`
+        with an unclamped-sounding description while the real ceiling is
+        enforced silently.
         """
         replies = run_server(INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         by_name = {t["name"]: t for t in replies[1]["result"]["tools"]}
@@ -507,14 +511,13 @@ class TestToolCallErrors(unittest.TestCase):
         self.assertNotIn("unexpectedly", result["content"][0]["text"])
 
     def test_unknown_argument_key_is_a_tool_error(self) -> None:
-        """Finding 3: additionalProperties: false is declared in every
-        schema (see TestToolListing.test_schemas_are_well_formed) but
-        nothing enforced it before this fix — {"query": "x", "bogus":
-        "yes"} was silently accepted. Concrete harm named in review: a
-        model typing "domain" instead of "domains" got an UNFILTERED
-        search silently presented as a filtered one. No PERPLEXITY_API_KEY
-        is set: the rejection must happen before any upstream call, purely
-        from the argument shape.
+        """additionalProperties: false is declared in every schema (see
+        TestToolListing.test_schemas_are_well_formed), so it must actually
+        be enforced — {"query": "x", "bogus": "yes"} must not be silently
+        accepted. Concretely: a model typing "domain" instead of "domains"
+        must not get an UNFILTERED search silently presented as a filtered
+        one. No PERPLEXITY_API_KEY is set: the rejection must happen before
+        any upstream call, purely from the argument shape.
         """
         replies = run_server(
             INIT,

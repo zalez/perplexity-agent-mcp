@@ -75,10 +75,10 @@ class TestRequest(AuthedClientTestCase):
         self.assertIn("Invalid API key", ctx.exception.message)
 
     def test_upstream_error_message_is_truncated_visibly(self) -> None:
-        """Finding 5: `_error_message`'s echoed upstream message had no
-        length cap, unlike every other upstream string this module echoes
-        to a model (source titles, urls, status). The real ceiling used to
-        be only the 32 MiB HTTP response cap.
+        """`_error_message`'s echoed upstream message needs the same length
+        cap as every other upstream string this module echoes to a model
+        (source titles, urls, status) — the real ceiling is otherwise only
+        the 32 MiB HTTP response cap.
         """
         long_message = "x" * (srv._MAX_ERROR_CHARS + 100)
         self.fake.script((400, {"error": {"message": long_message}}))
@@ -90,7 +90,7 @@ class TestRequest(AuthedClientTestCase):
         )
 
     def test_non_retryable_http_error_carries_the_status(self) -> None:
-        """Finding 1: PerplexityError.status lets a caller (tool_cancel) make
+        """PerplexityError.status lets a caller (tool_cancel) make
         status-coded decisions without parsing prose Perplexity never
         promises to keep stable.
         """
@@ -100,9 +100,9 @@ class TestRequest(AuthedClientTestCase):
         self.assertEqual(ctx.exception.status, 400)
 
     def test_network_error_has_no_status(self) -> None:
-        """The other half of Finding 1's fix: a failure that never reached
-        an HTTP response must never be mistaken for one, whatever status
-        code a caller might otherwise be tempted to assume.
+        """A failure that never reached an HTTP response must never be
+        mistaken for one, whatever status code a caller might otherwise be
+        tempted to assume.
         """
         with unittest.mock.patch("perplexity_agent_mcp._OPENER.open", side_effect=OSError("boom")):
             with unittest.mock.patch("perplexity_agent_mcp.time.sleep"):
@@ -310,12 +310,12 @@ class TestRedirect(AuthedClientTestCase):
 
 
 class TestRequestDeadline(AuthedClientTestCase):
-    """`_request`'s optional `deadline` - the fix for Finding 1: without it,
-    `_request`'s own retry loop can burn far more real time than any budget
-    a caller like `_poll` thinks it is enforcing. See `_request`'s docstring
-    for the full mechanism; these tests exercise it directly, against a
-    mocked `_OPENER.open` rather than the fake server, so no test here waits
-    for real time beyond microseconds (TestPoll below has the one test that
+    """`_request`'s optional `deadline`: without it, `_request`'s own retry
+    loop can burn far more real time than any budget a caller like `_poll`
+    thinks it is enforcing. See `_request`'s docstring for the full
+    mechanism; these tests exercise it directly, against a mocked
+    `_OPENER.open` rather than the fake server, so no test here waits for
+    real time beyond microseconds (TestPoll below has the one test that
     exercises a genuinely slow upstream end to end).
     """
 
@@ -478,6 +478,21 @@ class TestParsing(unittest.TestCase):
             ]
         }
         self.assertEqual(srv._extract_answer(payload), "Alpha. Beta.")
+
+    def test_overlong_answer_is_truncated_visibly(self) -> None:
+        """A chopped answer must carry the same visible marker as every
+        other truncated field in this module (source titles/urls, upstream
+        error messages) — a bare slice here would let a cut-off answer
+        reach the model looking complete, with no way to tell it apart
+        from a genuinely finished one.
+        """
+        long_text = "x" * (srv._MAX_ANSWER_CHARS + 100)
+        payload: dict[str, object] = {
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": long_text}]}]
+        }
+        answer = srv._extract_answer(payload)
+        self.assertEqual(len(answer), srv._MAX_ANSWER_CHARS)
+        self.assertTrue(answer.endswith("…"), "truncation must be visible, not silent")
 
     def test_sources_come_from_search_results_deduped_by_url(self) -> None:
         sources = srv._extract_sources(COMPLETED)
@@ -678,9 +693,8 @@ class TestWaitBudget(unittest.TestCase):
             self.assertEqual(srv._wait_budget(), 300)
 
     def test_absurdly_large_value_is_clamped_not_returned_verbatim(self) -> None:
-        """Finding 2: every OTHER malformed input degrades to the default;
-        an oversized one used to be the sole exception, passed through
-        verbatim.
+        """Every OTHER malformed input degrades to the default; an oversized
+        one must not be the sole exception passed through verbatim.
         """
         env = {"PERPLEXITY_AGENT_WAIT_SECONDS": "99999999999999999999"}
         with unittest.mock.patch.dict("os.environ", env):
@@ -728,11 +742,10 @@ class TestSubmit(AuthedClientTestCase):
             srv._submit("why?", "medium", None, None)
 
     def test_submit_forwards_a_given_deadline_to_request(self) -> None:
-        """Carried from Task 4/5's review (Finding 1, continued): _submit's
-        own call into _request can retry for up to ~90s on its own when
-        given no deadline (see _request's docstring). A tool call must be
-        able to bound _submit the same end-to-end way _poll already bounds
-        itself — this is the wiring that makes that possible.
+        """_submit's own call into _request can retry for up to ~90s on its
+        own when given no deadline (see _request's docstring). A tool call
+        must be able to bound _submit the same end-to-end way _poll already
+        bounds itself — this is the wiring that makes that possible.
         """
         with unittest.mock.patch(
             "perplexity_agent_mcp._request",
@@ -765,12 +778,12 @@ class TestPoll(AuthedClientTestCase):
         self.assertEqual(payload["status"], "completed")
 
     def test_poll_passes_a_deadline_computed_from_the_budget(self) -> None:
-        """Wiring proof for Finding 1: _poll must hand _request a deadline
-        derived from ITS OWN start time and budget, not leave it unbounded.
-        This only checks that the NUMBER handed over is right; the
-        TestRequestDeadline tests above prove what _request then DOES with
-        it, and test_poll_gives_up_promptly_even_when_the_upstream_is_slow
-        below proves the two work together end to end.
+        """Wiring proof: _poll must hand _request a deadline derived from
+        ITS OWN start time and budget, not leave it unbounded. This only
+        checks that the NUMBER handed over is right; the TestRequestDeadline
+        tests above prove what _request then DOES with it, and
+        test_poll_gives_up_promptly_even_when_the_upstream_is_slow below
+        proves the two work together end to end.
         """
         with unittest.mock.patch(
             "perplexity_agent_mcp._request", return_value=COMPLETED
@@ -862,12 +875,11 @@ class TestPoll(AuthedClientTestCase):
         self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [2.0])
 
     def test_progress_value_increases_across_notifications(self) -> None:
-        """Finding 7: MCP's progress utility requires the `progress` value
-        to increase with every notification for a given token, even with an
-        unknown total. `_poll` used to hand `_progress_notifier`'s closure a
-        hardcoded 0 on every call; it already has `elapsed` in hand, so this
-        proves that value is actually threaded through notify(), not just
-        sitting unused in a local variable.
+        """MCP's progress utility requires the `progress` value to increase
+        with every notification for a given token, even with an unknown
+        total. `_poll` already has `elapsed` in hand; this proves that value
+        is actually threaded through notify(), not just sitting unused in a
+        local variable.
         """
         self.fake.script((200, QUEUED), (200, RUNNING), (200, COMPLETED))
         seen: list[float] = []

@@ -44,7 +44,7 @@ Initial release.
   (secret scanning and GitHub Actions security auditing), and
   packaging/smoke-test jobs — 8 jobs total, all green on GitHub-hosted
   runners.
-- 157 tests, stdlib `unittest` only, requiring no install step for
+- 158 tests, stdlib `unittest` only, requiring no install step for
   contributors either.
 
 [Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.1.0...HEAD
