@@ -36,6 +36,12 @@ class FakePerplexity:
         # every test that needs this wants "the upstream is slow", not a
         # specific request singled out.
         self.response_delay = 0.0
+        # Extra headers sent with every response from _next() onward, on top
+        # of Content-Type/Content-Length. Set only via script_redirect()
+        # below: a Location header is the one case this harness needs to
+        # control that script()'s (status, json_body) shape has no room for
+        # -- a redirect's whole point is the header, not the body.
+        self._extra_headers: dict[str, str] = {}
 
         fake = self
 
@@ -61,6 +67,8 @@ class FakePerplexity:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
+                for name, value in fake._extra_headers.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(encoded)
 
@@ -99,6 +107,19 @@ class FakePerplexity:
         """Queue responses, served in order. The last one repeats."""
         self._responses = list(responses)
         self._index = 0
+        self._extra_headers = {}
+
+    def script_redirect(self, status: int, location: str) -> None:
+        """Queue a single 3xx response carrying a Location header.
+
+        Perplexity's real API never redirects; this exists purely so a test
+        can prove _request's opener refuses to follow one anyway. Kept
+        separate from script() rather than widening its tuple shape -- a
+        redirect's whole content IS the header, not a JSON body.
+        """
+        self._responses = [(status, {})]
+        self._index = 0
+        self._extra_headers = {"Location": location}
 
     @property
     def url(self) -> str:

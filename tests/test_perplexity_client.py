@@ -104,7 +104,7 @@ class TestRequest(AuthedClientTestCase):
         an HTTP response must never be mistaken for one, whatever status
         code a caller might otherwise be tempted to assume.
         """
-        with unittest.mock.patch("urllib.request.urlopen", side_effect=OSError("boom")):
+        with unittest.mock.patch("perplexity_agent_mcp._OPENER.open", side_effect=OSError("boom")):
             with unittest.mock.patch("perplexity_agent_mcp.time.sleep"):
                 with self.assertRaises(srv.PerplexityError) as ctx:
                     srv._request("GET", "/v1/agent/resp_1")
@@ -148,7 +148,9 @@ class TestRequest(AuthedClientTestCase):
         """
         poisoned = OSError("reset while sending 'Authorization: Bearer pplx-test-key'")
         with (
-            unittest.mock.patch("urllib.request.urlopen", side_effect=poisoned) as mock_urlopen,
+            unittest.mock.patch(
+                "perplexity_agent_mcp._OPENER.open", side_effect=poisoned
+            ) as mock_open,
             unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep,
         ):
             with self.assertRaises(srv.PerplexityError) as ctx:
@@ -156,9 +158,10 @@ class TestRequest(AuthedClientTestCase):
         self.assertNotIn("pplx-test-key", str(ctx.exception))
         self.assertNotIn("pplx-test-key", ctx.exception.message)
         self.assertIn("OSError", ctx.exception.message)
-        # urlopen is itself the mock here, so there is no upstream request to
-        # count; retry is proven by how many times urlopen was invoked instead.
-        self.assertEqual(mock_urlopen.call_count, 3, "all 3 attempts must be made")
+        # _OPENER.open is itself the mock here, so there is no upstream
+        # request to count; retry is proven by how many times it was
+        # invoked instead.
+        self.assertEqual(mock_open.call_count, 3, "all 3 attempts must be made")
         self.assertEqual(mock_sleep.call_count, 2, "two backoffs between three attempts")
         first_delay = mock_sleep.call_args_list[0].args[0]
         second_delay = mock_sleep.call_args_list[1].args[0]
@@ -228,13 +231,91 @@ class TestRequest(AuthedClientTestCase):
         )
 
 
+class TestRedirect(AuthedClientTestCase):
+    """`_OPENER`'s redirect refusal. urllib's default HTTPRedirectHandler
+    follows a 3xx and carries every header on the original request across to
+    the new one UNCHANGED — Authorization included, even cross-host, even
+    https -> http. A hostile or merely compromised upstream could use that
+    to steal the API key with nothing more than a 302. `_NoRedirectHandler`
+    (see its comment beside `_OPENER`) makes urllib raise instead of follow.
+
+    The strongest version of "the key never reaches a redirect target" -
+    proving a SECOND server gets no request at all, not just that this one
+    raises - lives in test_no_secrets.py's TestKeyStaysOutOfUpstreamRequests,
+    alongside this module's other over-the-wire key-locality checks. These
+    tests cover `_request`'s own behaviour: it raises rather than follows,
+    the status and message are right, and - critically, since a retried
+    redirect is just a slower way to leak the key - it is never retried.
+    """
+
+    def test_redirect_is_refused_not_followed(self) -> None:
+        """Not followed means not followed even once: a self-referential
+        Location (same fake, different path) lets a reverted fix keep
+        going through several real hops before urllib's OWN loop detection
+        eventually gives up -- still ending in an HTTPError with a 302
+        stamped on it, which would let a weaker assertion here pass by
+        accident. Asserting the request count too closes that gap: the
+        fixed behaviour is refusal on the FIRST response, not eventual
+        failure after a chase.
+        """
+        self.fake.script_redirect(302, self.fake.url + "/v1/agent/elsewhere")
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv._request("GET", "/v1/agent/resp_1")
+        # status=302, not None: this took the HTTPError branch, same as any
+        # other non-2xx response - see PerplexityError's own docstring for
+        # why callers like tool_cancel depend on that distinction.
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertEqual(len(self.fake.requests), 1, "must not even attempt to follow it")
+
+    def test_redirect_is_not_retried(self) -> None:
+        """302 is not in _RETRY_STATUSES. Confirm the existing status-keyed
+        retry check already treats a refused redirect as a hard failure,
+        rather than this fix accidentally routing it through the retry
+        loop - a retried redirect would just be a slower way to ask urllib
+        to leak the key, not a fix.
+        """
+        self.fake.script_redirect(302, self.fake.url + "/v1/agent/elsewhere")
+        with self.assertRaises(srv.PerplexityError):
+            srv._request("GET", "/v1/agent/resp_1")
+        self.assertEqual(len(self.fake.requests), 1, "a redirect must not be retried")
+
+    def test_redirect_message_is_readable_and_key_free(self) -> None:
+        """The message a model sees must say plainly what happened - not
+        just echo a bare status code indistinguishable from an ordinary
+        upstream error - and, as for every PerplexityError, must never
+        carry the key or the Authorization header.
+        """
+        self.fake.script_redirect(302, self.fake.url + "/v1/agent/elsewhere")
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv._request("GET", "/v1/agent/resp_1")
+        self.assertIn("redirect", ctx.exception.message.lower())
+        self.assertIn("302", ctx.exception.message)
+        self.assertNotIn("pplx-test-key", ctx.exception.message)
+        self.assertNotIn("Authorization", ctx.exception.message)
+
+    def test_post_redirect_is_also_refused(self) -> None:
+        """`_submit` is this server's one POST call site, and stock urllib
+        treats POST specially: a 301/302/303 downgrades it to a GET and
+        (unlike this test's siblings above) actually attempts the follow-up
+        request rather than raising outright, so this genuinely exercises
+        `_NoRedirectHandler` rather than passing on a method it never
+        reaches. Proves refusal does not depend on the request having been
+        a GET.
+        """
+        self.fake.script_redirect(302, self.fake.url + "/v1/agent/elsewhere")
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv._request("POST", "/v1/agent", {"input": "x"})
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertEqual(len(self.fake.requests), 1)
+
+
 class TestRequestDeadline(AuthedClientTestCase):
     """`_request`'s optional `deadline` - the fix for Finding 1: without it,
     `_request`'s own retry loop can burn far more real time than any budget
     a caller like `_poll` thinks it is enforcing. See `_request`'s docstring
     for the full mechanism; these tests exercise it directly, against a
-    mocked `urlopen` rather than the fake server, so no test here waits for
-    real time beyond microseconds (TestPoll below has the one test that
+    mocked `_OPENER.open` rather than the fake server, so no test here waits
+    for real time beyond microseconds (TestPoll below has the one test that
     exercises a genuinely slow upstream end to end).
     """
 
@@ -248,25 +329,31 @@ class TestRequestDeadline(AuthedClientTestCase):
     def test_deadline_clamps_the_socket_timeout_to_remaining_time(self) -> None:
         response = self._mock_response({"id": "resp_1", "status": "queued"})
         deadline = time.monotonic() + 5.0
-        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._OPENER.open", return_value=response
+        ) as mock_open:
             srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
-        timeout = mock_urlopen.call_args.kwargs["timeout"]
+        timeout = mock_open.call_args.kwargs["timeout"]
         # ~5s remaining, minus the (negligible) time spent getting here.
         self.assertTrue(4.5 <= timeout <= 5.0, f"expected timeout near 5.0, got {timeout}")
 
     def test_deadline_never_exceeds_the_normal_socket_timeout(self) -> None:
         response = self._mock_response({"id": "resp_1", "status": "queued"})
         deadline = time.monotonic() + 1000.0  # far more than _SOCKET_TIMEOUT
-        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._OPENER.open", return_value=response
+        ) as mock_open:
             srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
-        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], srv._SOCKET_TIMEOUT)
+        self.assertEqual(mock_open.call_args.kwargs["timeout"], srv._SOCKET_TIMEOUT)
 
     def test_deadline_floors_the_socket_timeout_at_one_second(self) -> None:
         response = self._mock_response({"id": "resp_1", "status": "queued"})
         deadline = time.monotonic() + 0.2  # almost no time left, but > 0
-        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._OPENER.open", return_value=response
+        ) as mock_open:
             srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
-        timeout = mock_urlopen.call_args.kwargs["timeout"]
+        timeout = mock_open.call_args.kwargs["timeout"]
         self.assertEqual(timeout, 1.0, "a sub-second timeout would fire on ordinary latency")
 
     def test_deadline_already_in_the_past_still_gets_one_bounded_attempt(self) -> None:
@@ -282,11 +369,13 @@ class TestRequestDeadline(AuthedClientTestCase):
         """
         response = self._mock_response({"id": "resp_1", "status": "queued"})
         deadline = time.monotonic() - 5.0  # unambiguously already in the past
-        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._OPENER.open", return_value=response
+        ) as mock_open:
             result = srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
         self.assertEqual(result["id"], "resp_1")
-        self.assertEqual(mock_urlopen.call_count, 1)
-        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 1.0, "floored, not refused")
+        self.assertEqual(mock_open.call_count, 1)
+        self.assertEqual(mock_open.call_args.kwargs["timeout"], 1.0, "floored, not refused")
 
     def test_deadline_already_in_the_past_still_suppresses_a_retry(self) -> None:
         """The one bounded attempt proven above must not become two: once
@@ -297,13 +386,13 @@ class TestRequestDeadline(AuthedClientTestCase):
         deadline = time.monotonic() - 5.0
         with (
             unittest.mock.patch(
-                "urllib.request.urlopen", side_effect=OSError("boom")
-            ) as mock_urlopen,
+                "perplexity_agent_mcp._OPENER.open", side_effect=OSError("boom")
+            ) as mock_open,
             unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep,
         ):
             with self.assertRaises(srv.PerplexityError):
                 srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
-        self.assertEqual(mock_urlopen.call_count, 1, "one bounded attempt, never a retry")
+        self.assertEqual(mock_open.call_count, 1, "one bounded attempt, never a retry")
         mock_sleep.assert_not_called()
 
     def test_deadline_suppresses_a_retry_that_would_overrun_it(self) -> None:
@@ -315,13 +404,13 @@ class TestRequestDeadline(AuthedClientTestCase):
         deadline = time.monotonic() + 0.1
         with (
             unittest.mock.patch(
-                "urllib.request.urlopen", side_effect=OSError("connection reset")
-            ) as mock_urlopen,
+                "perplexity_agent_mcp._OPENER.open", side_effect=OSError("connection reset")
+            ) as mock_open,
             unittest.mock.patch("perplexity_agent_mcp.time.sleep") as mock_sleep,
         ):
             with self.assertRaises(srv.PerplexityError):
                 srv._request("GET", "/v1/agent/resp_1", deadline=deadline)
-        self.assertEqual(mock_urlopen.call_count, 1, "must not retry once backoff would overrun")
+        self.assertEqual(mock_open.call_count, 1, "must not retry once backoff would overrun")
         mock_sleep.assert_not_called()
 
     def test_no_deadline_behaves_exactly_as_before(self) -> None:
@@ -331,9 +420,11 @@ class TestRequestDeadline(AuthedClientTestCase):
         explicit for the one new knob this task added.
         """
         response = self._mock_response({"id": "resp_1", "status": "queued"})
-        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as mock_urlopen:
+        with unittest.mock.patch(
+            "perplexity_agent_mcp._OPENER.open", return_value=response
+        ) as mock_open:
             srv._request("GET", "/v1/agent/resp_1")
-        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], srv._SOCKET_TIMEOUT)
+        self.assertEqual(mock_open.call_args.kwargs["timeout"], srv._SOCKET_TIMEOUT)
 
 
 # A realistic completed response. Field names verified against the live API on

@@ -331,7 +331,7 @@ class TestCancelTool(LifecycleTestCase):
         message.
         """
         with (
-            unittest.mock.patch("urllib.request.urlopen", side_effect=OSError("boom")),
+            unittest.mock.patch("perplexity_agent_mcp._OPENER.open", side_effect=OSError("boom")),
             unittest.mock.patch("perplexity_agent_mcp.time.sleep"),
         ):
             with self.assertRaises(srv.PerplexityError) as ctx:

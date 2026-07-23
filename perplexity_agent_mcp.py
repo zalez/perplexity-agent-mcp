@@ -105,6 +105,53 @@ WAIT_SECONDS_DEFAULT = 55
 # instead of having to know that it is the default.
 _SSL_CONTEXT = ssl.create_default_context()
 
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every HTTP redirect. See `_OPENER` just below for why.
+
+    `redirect_request` returning `None` is not "no opinion, ask another
+    handler" here — nothing else installed on `_OPENER` handles a 3xx
+    either, so urllib gives up and raises `HTTPError` with the ORIGINAL
+    redirect status instead of following it. `_request` then treats that
+    exactly like any other non-2xx response: a 3xx is not in
+    `_RETRY_STATUSES`, so it becomes a `PerplexityError` on the very first
+    attempt, never retried.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
+# urlopen()'s default behaviour is to FOLLOW a redirect: it rebuilds the
+# request for the Location it was given and replays it — and CPython's
+# HTTPRedirectHandler carries every header on the original request across to
+# that replay UNCHANGED, Authorization included. It strips only
+# Content-Length and Content-Type. The new request can be on a different
+# host, and can be plain http:// even when the original was https://; urllib
+# does not care. That is genuinely surprising — surprising enough that a
+# future maintainer, finding this hand-rolled opener where a one-line
+# urlopen() call would otherwise be, could reasonably read it as unneeded
+# ceremony and "simplify" it back out. It is not: without this, a redirect
+# response from api.perplexity.ai — from a compromised upstream, a
+# misconfigured proxy in front of it, or a captive network the user is on —
+# would hand this program's API key to whatever host the Location header
+# names, over cleartext if that header names one. Built once at import time
+# and reused for every call: an HTTPSHandler bound to the same explicit
+# _SSL_CONTEXT used before (so certificate verification stays exactly as
+# visible as it was as a urlopen() keyword argument), plus the
+# redirect-refusing handler above, and nothing else.
+_OPENER = urllib.request.build_opener(
+    _NoRedirectHandler(), urllib.request.HTTPSHandler(context=_SSL_CONTEXT)
+)
+
 # Per-request socket timeout. Every individual call is short — we poll rather
 # than holding one socket open for the length of a research run.
 _SOCKET_TIMEOUT = 30.0
@@ -274,9 +321,7 @@ def _request(
             request.add_header("Content-Type", "application/json")
 
         try:
-            with urllib.request.urlopen(  # noqa: S310
-                request, timeout=timeout, context=_SSL_CONTEXT
-            ) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return _decode(_read_capped(response.read, _MAX_RESPONSE_BYTES))
         except urllib.error.HTTPError as exc:
             # HTTPError is itself a file-like response object wrapping a live
@@ -287,7 +332,22 @@ def _request(
             # not guarantee, and skipping the close emits a real ResourceWarning.
             with exc:
                 payload = _safe_json(_read_capped(exc.read, _MAX_RESPONSE_BYTES))
-                message = _error_message(payload, exc.code)
+                if 300 <= exc.code < 400:
+                    # _NoRedirectHandler turned what would otherwise have
+                    # been a followed redirect into this HTTPError, carrying
+                    # the ORIGINAL 3xx status untouched (see _OPENER's
+                    # comment for why one is refused at all). Say so
+                    # plainly instead of falling through to
+                    # _error_message's generic "Perplexity returned HTTP
+                    # {status}." — a bare status code there would read as
+                    # an ordinary upstream error, not the deliberate
+                    # refusal this actually is.
+                    message = (
+                        f"Perplexity returned an HTTP {exc.code} redirect, which this "
+                        "server refuses to follow."
+                    )
+                else:
+                    message = _error_message(payload, exc.code)
                 if exc.code not in _RETRY_STATUSES:
                     # A bad request retried is just a slower bad request.
                     # status=exc.code is what lets tool_cancel key its

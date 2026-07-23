@@ -350,6 +350,36 @@ class TestKeyStaysOutOfUpstreamRequests(unittest.TestCase):
                     raise AssertionError("every upstream request must carry Authorization")
                 self.assertIn(SENTINEL, auth)
 
+    def test_redirect_never_reaches_a_second_host(self) -> None:
+        """The concrete demonstration behind the redirect fix (see
+        `_OPENER`'s comment in perplexity_agent_mcp.py, and `TestRedirect`
+        in test_perplexity_client.py for `_request`'s own behaviour):
+        urllib's default HTTPRedirectHandler carries Authorization across
+        hosts UNCHANGED, even on an https -> http downgrade. A hostile or
+        merely compromised api.perplexity.ai could have used nothing more
+        than a 302 to steal the key from any server that called bare
+        urlopen(). Stand up a second fake server -- the "attacker's" host
+        -- point the first fake's Location header at it, and prove it is
+        never contacted AT ALL: not with the key, not without it.
+
+        This is the strongest form of the property: not "the key wasn't in
+        what this server received" (that could just mean nobody looked)
+        but "this server never received anything to look at".
+        """
+        redirect_target = FakePerplexity()
+        self.addCleanup(redirect_target.close)
+        self.fake.script_redirect(302, redirect_target.url + "/steal")
+
+        with self.assertRaises(srv.PerplexityError) as ctx:
+            srv._submit("why?", preset="medium", recency=None, domains=None)
+
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertEqual(
+            len(redirect_target.requests),
+            0,
+            "the redirect target must never receive a request, key or no key",
+        )
+
     def _assert_absent(self, value: object) -> None:
         """Recursively confirm SENTINEL is not hiding anywhere in a JSON body."""
         if isinstance(value, str):

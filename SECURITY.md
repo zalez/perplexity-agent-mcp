@@ -54,10 +54,12 @@ What it protects, structurally:
   32 MiB cap on any single HTTP response (`_MAX_RESPONSE_BYTES`), an answer
   capped at 60,000 characters and a source list capped at 50 entries (title
   and URL individually bounded too) so a runaway `wide-research` run can't
-  blow up a client's context window, and an 8 MiB cap on any single incoming
-  request line so a malformed or endless line from the client side can't grow
-  this process's memory without bound (see `serve()`'s docstring for the
-  three distinct ways an unbounded read loop could otherwise die).
+  blow up a client's context window, and an 8,388,608-character cap
+  (`_MAX_LINE_CHARS` — characters, not bytes, since `serve()` reads an
+  already UTF-8-decoded stream) on any single incoming request line so a
+  malformed or endless line from the client side can't grow this process's
+  memory without bound (see `serve()`'s docstring for the three distinct ways
+  an unbounded read loop could otherwise die).
 
 What is explicitly **out of scope** for a report against this repository:
 

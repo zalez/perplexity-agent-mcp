@@ -4,7 +4,7 @@
 
 A single-file, zero-third-party-dependency [MCP](https://modelcontextprotocol.io/) server for Perplexity's [Agent API](https://docs.perplexity.ai/docs/agent-api/quickstart) — multi-step web research with citations, exposed to any MCP client over stdio.
 
-Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,365 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
+Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,448 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
 
 ## Why this exists
 
@@ -202,7 +202,7 @@ cd perplexity-agent-mcp
 python3 -m unittest discover
 ```
 
-151 tests, pure standard library — `tests/fake_perplexity.py` runs a fake Perplexity over `http.server`, in-process, so nothing real is ever called.
+157 tests, pure standard library — `tests/fake_perplexity.py` runs a fake Perplexity over `http.server`, in-process, so nothing real is ever called.
 
 Before committing, install the git hooks once and let them run automatically after that:
 
