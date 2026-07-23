@@ -214,8 +214,17 @@ obligation to always conform, and Perplexity returns free-form prose.
 ### 6.1 `perplexity_agent` — start a research run
 
 - **title:** `Perplexity Agent Research`
-- **annotations:** `{"readOnlyHint": true, "openWorldHint": true}`
-  (defaults are pessimistic; silence means clients must assume destructive)
+- **annotations:** `{"readOnlyHint": false, "destructiveHint": false,
+  "idempotentHint": false, "openWorldHint": true}`
+
+  **Revised during implementation (owner decision).** This originally read
+  `readOnlyHint: true`. A reviewer pointed out that the tool creates durable,
+  billable, cancellable upstream state — the very state whose removal §6.3
+  annotates `destructiveHint: true` — and that clients use `readOnlyHint` to
+  decide auto-approval. Claiming read-only would be untrue. `destructiveHint`
+  is stated explicitly because it defaults to **true** once `readOnlyHint` is
+  false, and this tool destroys nothing. The cost is that some clients will
+  prompt before each run; that is the correct trade when each run spends money.
 - **description:** Run a research query through Perplexity's Agent API (multi-step
   web research with citations). Use for deep or multi-hop questions where a single
   synthesized, sourced answer is wanted. With `wait: true` (default) this blocks
