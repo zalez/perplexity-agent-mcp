@@ -118,13 +118,21 @@ al., ["Defending Against Indirect Prompt Injection Attacks With Spotlighting"](h
 (Microsoft Research, arXiv:2403.14720).
 
 **We implement delimiting, not the paper's own recommended datamarking — and
-that's a deliberate trade, not a shortcut.** Datamarking interleaves a marker
-character through the *whitespace* of the untrusted text itself. For a tool
-whose entire job is handing back prose a human will read and cite — with
-URLs in it — that would mangle the URLs and make the answer unquotable. That
-is the wrong trade here. Delimiting still buys the property that matters most:
-a hostile page can no longer forge its way past a fixed or guessable boundary.
-It does so without corrupting the one thing this tool exists to produce.
+that's a deliberate trade, not a shortcut.** The paper's own numbers size the
+trade. Across the spotlighting family — delimiting, datamarking, and
+encoding — it reports attack success rate dropping from greater than 50% to
+below 2%. On its own GPT-3.5-Turbo summarization benchmark, delimiting alone
+cuts ASR by about half from a ~60% baseline; datamarking alone cuts a ~50%
+baseline to below 3%. That gap is exactly why the paper's own recommendation
+is to use "at least datamarking" — citing its large improvement over
+delimiting and its lack of any measured hit to downstream task performance.
+Datamarking interleaves a marker character through the *whitespace* of the
+untrusted text itself. For a tool whose entire job is handing back prose a
+human will read and cite — with URLs in it — that would mangle the URLs and
+make the answer unquotable. That is the wrong trade here. Delimiting still
+buys the property that matters most: a hostile page can no longer forge its
+way past a fixed or guessable boundary. It does so without corrupting the one
+thing this tool exists to produce.
 
 **This is a mitigation, not a fix, and we're not going to imply otherwise.**
 No MCP client is obliged to preserve or even display the delimiter — a client
@@ -156,10 +164,12 @@ neutralized rather than trusted, and that the answer, the source list, and the
   `TOOL_SCHEMAS` declare anything like `api_key`, `key`, or `token`, and
   `_reject_unknown_arguments` rejects any argument a schema doesn't declare —
   so even a model that tries to pass one gets a clean rejection, not a request
-  that quietly uses it. The [MCP specification calls this "token passthrough" and forbids it outright](https://modelcontextprotocol.io/specification/2025-11-25/basic/security_best_practices#token-passthrough):
-  a server must not accept a caller-supplied credential and forward it
-  upstream. This server structurally can't — there's no parameter to put one
-  in.
+  that quietly uses it. A key-shaped parameter would let anything able to
+  call this server exfiltrate the key just by asking for it back — in the
+  same spirit as the [MCP specification's own guidance that `stdio` servers
+  should source credentials from the environment rather than accept them as
+  input](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
+  This server structurally can't — there's no parameter to put one in.
 - **Never logged.** All diagnostics go through `_log()` to stderr as fixed
   strings; the key is never interpolated into a log line.
 - **Never attached to an exception.** `PerplexityError.message` is built only
