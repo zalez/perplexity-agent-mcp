@@ -246,6 +246,21 @@ closes that off entirely: the *only* way to change where the key goes is to
 edit the script itself — the one artifact this whole project's audit story is
 built around.
 
+**Redirects are refused.** This one is not obvious, and it was found in review
+rather than by design. `urllib.request.urlopen` follows HTTP redirects by
+default, and CPython's redirect handler strips only `Content-Length` and
+`Content-Type` — the **`Authorization` header survives, including across
+hosts**. A hostile or compromised upstream could therefore have obtained the
+key with a single `302`, and nothing stops the target being plain `http://`,
+which would put it in cleartext on the wire. Hardcoding the host does not help
+here: the redirect comes from the legitimate host.
+
+So the server builds its own opener whose redirect handler returns `None`, and
+a `3xx` surfaces as an ordinary error instead of being followed. It is never
+retried. This is why `_OPENER` exists rather than a plain `urlopen` call; the
+one-line "simplification" back to `urlopen` reopens the hole silently, with no
+test failure to warn you unless you keep the redirect tests.
+
 The one piece of genuinely *dynamic* URL construction that does exist —
 `response_id`, echoed back by Perplexity and interpolated into
 `GET /v1/agent/{response_id}` — is still treated as untrusted input even

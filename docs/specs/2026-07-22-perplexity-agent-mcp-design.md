@@ -147,7 +147,7 @@ Each decision records its rationale so it is not silently reversed later.
 | # | Decision | Rationale |
 |---|---|---|
 | D1 | **Single file + PEP 723**, plus an opt-in `pyproject.toml` for `uvx` | The audit boundary stays exactly one file. Packaging is a delivery mechanism that ships *the same bytes*, not extra code. |
-| D2 | **Target MCP `2025-11-25`**, flat dispatch dict | Every shipping client speaks it today. `2026-07-28` lands in 6 days but clients need their own dual-era support first, and stdio framing is unchanged — so `server/discover` is a later additive change, not a rewrite. |
+| D2 | **Target MCP `2025-11-25`**, flat dispatch dict | Every shipping client speaks it today. `2026-07-28` lands five days after this was written, but clients need their own dual-era support first, and stdio framing is unchanged — so `server/discover` is a later additive change, not a rewrite. |
 | D3 | **Python floor 3.10**, develop and gate on 3.14 | The client config invokes bare `python3`; stock macOS `python3` is 3.9.6. Nothing here needs modern syntax. 3.9 is EOL and documenting an EOL floor on a security repo looks bad. Matrix proves the floor is real. |
 | D4 | **stdlib `unittest`, fake upstream via `http.server`** | `git clone && python3 -m unittest` with nothing installed. The zero-supply-chain claim then holds for contributors too, not just users. |
 | D5 | **Background + poll** upstream, always | One code path for every preset. Each HTTP call is short, so a network blip cannot kill a long run. The deep presets are the entire reason this project exists. |
@@ -190,13 +190,14 @@ module docstring            ← flit reads this as the package description
 __version__                 ← flit reads this as the package version
 Python version guard        ← clear message, not a SyntaxError
 stdout capture + rebind     ← see §9.2
-constants (API URLs, protocol versions, wait budget, TOOLS schema)
+constants (API URL, protocol versions, wait budget, caps)
+_OPENER                     ← refuses redirects; see §9.3
 _request()                  ← the network choke point
 _submit() / _poll() / _cancel()
 _extract_answer() / _extract_sources() / _progress_summary()
 _spotlight()                ← untrusted-content wrapper
 tool_agent() / tool_result() / tool_cancel()
-TOOLS = {...}               ← name → (schema, implementation)
+TOOL_SCHEMAS / TOOL_IMPLS   ← the declared surface, and what runs it
 handle_initialize() / handle_tools_list() / handle_tools_call() / handle_ping()
 HANDLERS = {...}
 dispatch()
@@ -526,8 +527,8 @@ surfaced, but never headers and never a raw traceback.
 | `tests/test_no_secrets.py` | Key never appears in stdout, stderr, or any error message; no `pplx-` pattern anywhere in the tree |
 | `tests/test_tooling_parity.py` | `ruff`/`mypy` versions pinned identically in `.pre-commit-config.yaml` and `ci.yml` |
 
-Tests point the module's `_API_BASE` constant at the fake **in-process** — never
-via an environment variable (§9.3). The shipped file has no redirect path at all.
+Tests point the module's `API_BASE` constant at the fake **in-process** — never
+via an environment variable (§9.3). The shipped file offers no way to redirect it.
 
 ## 12. Repository layout
 
