@@ -23,10 +23,10 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: ${{ matrix.python }}
       - name: Run the test suite
@@ -37,10 +37,10 @@ jobs:
     name: lint and types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: "3.14"
       - name: Install pinned tools
@@ -49,14 +49,47 @@ jobs:
       - run: ruff format --check .
       - run: mypy --strict perplexity_agent_mcp.py
 
+  pre-commit:
+    name: pre-commit (secrets, Actions security, hygiene)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Install pre-commit
+        run: pip install pre-commit==4.5.1
+      - name: Run every hook that isn't already covered by another job
+        # This is the point of the job: 14 of the 18 hooks in
+        # .pre-commit-config.yaml (gitleaks, zizmor, actionlint, codespell,
+        # and the file-hygiene checks) previously ran ONLY on machines that
+        # had `pre-commit install`, so were fully bypassable via
+        # --no-verify or an edit through the GitHub web UI. Running the
+        # suite here closes that gap. ruff-check/ruff-format/mypy are
+        # skipped because the `lint` job above already runs them against
+        # the same pinned versions (tests/test_tooling_parity.py enforces
+        # that); unittest is skipped because the `test` matrix already runs
+        # it across all five supported Pythons, not just this job's one.
+        # Skipping both avoids running identical checks twice for no reason.
+        run: |
+          SKIP=ruff-check,ruff-format,mypy,unittest \
+            pre-commit run --all-files --show-diff-on-failure
+
   package:
     name: package and smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
       - name: Build the wheel
         run: uv build
       - name: Install it into a clean environment and drive the console script
