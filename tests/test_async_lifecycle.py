@@ -242,10 +242,22 @@ class TestCancelTool(LifecycleTestCase):
         self.assertIn("resp_x", text)
 
     def test_cancelling_a_finished_run_is_benign(self) -> None:
-        """Upstream 400 means the goal state is already reached, not a failure."""
+        """Upstream 400 means the goal state is already reached, not a
+        failure — but the message must not claim we KNOW that. Live
+        verification (2026-07-23) found Perplexity returns this identical
+        400 for a response_id that never existed at all (see
+        test_cancelling_an_unknown_id_gets_the_identical_benign_message
+        below), so the wording only asserts what holds either way: the id
+        is not an active run right now, not that it definitely once was.
+        """
         self.fake.script((400, {"error": {"message": "already terminal"}}))
         text = srv.tool_cancel({"response_id": "resp_x"}, None)
-        self.assertIn("already", text.lower())
+        self.assertIn("resp_x", text)
+        self.assertIn("not running now", text.lower())
+        self.assertIn("never existed", text.lower())
+        self.assertIn("perplexity_agent_result", text)
+        for word in ("bill", "cost", "charge", "refund", "money", "save"):
+            self.assertNotIn(word, text.lower())
 
     def test_cancelling_a_run_with_no_upstream_message_is_still_benign(self) -> None:
         """Finding 1, half A: a 400 with no error body at all falls back to
@@ -255,11 +267,48 @@ class TestCancelTool(LifecycleTestCase):
         RAISED here, misreporting Perplexity's own documented "already
         terminal" case as a failure. Keying on the status code instead
         fixes it: 400 is 400 regardless of what prose (if any) came with
-        it.
+        it — and, since the returned wording never reads exc.message at
+        all, it is exactly the same text as the case above where Perplexity
+        DID send a message.
         """
         self.fake.script((400, {}))
         text = srv.tool_cancel({"response_id": "resp_x"}, None)
-        self.assertIn("already", text.lower())
+        self.assertIn("not running now", text.lower())
+        self.assertIn("perplexity_agent_result", text)
+
+    def test_cancelling_an_unknown_id_gets_the_identical_benign_message(self) -> None:
+        """Live-verification finding, 2026-07-23: Perplexity's docs say an
+        unknown or cross-tenant response_id surfaces as 404. It does not.
+        Probed live with a well-formed but never-issued UUID
+        (resp_00000000-0000-0000-0000-000000000000) and a short nonsense id
+        (resp_deadbeef) — both returned this exact body, indistinguishable
+        from a genuinely-terminal run's:
+        {"error": {"message": "the run is already terminal and cannot be
+        cancelled", "type": "invalid_request", "code": 400}}.
+        Nothing in the response tells the two cases apart, so tool_cancel
+        can't either: this scripts that exact live-verified body behind a
+        response_id that was never issued, and asserts the SAME hedged
+        wording comes back as for a genuinely-finished run above — never a
+        claim that this id was ever a real, active run.
+        """
+        self.fake.script(
+            (
+                400,
+                {
+                    "error": {
+                        "message": "the run is already terminal and cannot be cancelled",
+                        "type": "invalid_request",
+                        "code": 400,
+                    }
+                },
+            )
+        )
+        text = srv.tool_cancel({"response_id": "resp_deadbeef"}, None)
+        self.assertIn("not running now", text.lower())
+        self.assertIn("never existed", text.lower())
+        self.assertIn("perplexity_agent_result", text)
+        for word in ("bill", "cost", "charge", "refund", "money", "save"):
+            self.assertNotIn(word, text.lower())
 
     def test_cancelling_a_revoked_key_run_still_raises_despite_the_word_already(self) -> None:
         """Finding 1, half B — the dangerous direction: a 401 body that

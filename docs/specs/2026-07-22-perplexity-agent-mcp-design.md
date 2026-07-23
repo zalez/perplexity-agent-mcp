@@ -135,6 +135,7 @@ Three questions the docs do not answer. Settled on 2026-07-22 by two live
 | Does cancelling reduce the bill? | **Unknowable.** A cancelled run reports **no `usage` and no `cost` at all**, even once terminal. We cannot distinguish "not billed" from "billed but not reported", and the docs are silent. **We must not claim cancellation saves money.** |
 | How slow is `medium` really? | **12.5 s** for a three-source comparison query. Far faster than assumed. One sample — do not over-fit — but the sync path will cover `fast`/`low`/`medium` in the common case. |
 | Cancel semantics | `POST /cancel` → 200 `{status: "cancelling"}`, terminal `cancelled` within ~3 s. Re-cancelling a terminal run → **400**. Matches docs. |
+| Cancel on a response_id that was never issued | **Contradicts the docs.** Docs say unknown/cross-tenant ids return 404. Live-probed 2026-07-23 with a well-formed but never-issued UUID and a short nonsense id — both returned **400** with the exact `"the run is already terminal and cannot be cancelled"` message a genuinely-terminal run also gets. Nothing in the response tells the two cases apart, so `tool_cancel`'s wording was changed to stop implying it can. |
 | SSE replay on a non-streamed run | Inconclusive (non-JSON response). Not used by this design. |
 
 ## 4. Decisions

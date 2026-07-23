@@ -901,7 +901,30 @@ def tool_cancel(args: dict[str, object], notify: ProgressFn | None) -> str:
         # response, never for a network failure (which correctly keeps
         # raising below, since `exc.status` stays `None`).
         if exc.status == 400:
-            return f"Run {response_id} had already finished or was already cancelled."
+            # Live-verification finding, 2026-07-23: Perplexity's docs say an
+            # unknown or cross-tenant response_id surfaces as 404. It does
+            # not. Probed live with a well-formed but never-issued UUID
+            # (resp_00000000-0000-0000-0000-000000000000) and a short
+            # nonsense id (resp_deadbeef) — both returned 400 with the exact
+            # body a genuinely-terminal run also returns: {"error":
+            # {"message": "the run is already terminal and cannot be
+            # cancelled", "type": "invalid_request", "code": 400}}. Nothing
+            # in the response distinguishes "already terminal" from "never
+            # existed", so this is not a parsing gap to close by reading the
+            # payload harder — there is no signal in it to read. Do not add
+            # a pre-flight existence check either: that is an extra
+            # billable round trip on this tool's own hot path and would
+            # still be racy against the run finishing between the check and
+            # the cancel itself. The wording below is chosen to stay true
+            # under EITHER cause: it asserts only what holds for both (the
+            # id is not an active run right now) and defers to
+            # perplexity_agent_result rather than guessing further.
+            return (
+                f"Run {response_id} is not running now — Perplexity returns this "
+                "same response whether the run already finished or the id never "
+                "existed. If you expected it to still be active, verify with "
+                "perplexity_agent_result before assuming this cancelled it."
+            )
         raise
 
 
@@ -1015,9 +1038,9 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
         "name": "perplexity_agent_cancel",
         "title": "Cancel Perplexity Research",
         "description": (
-            "Stop a research run that is no longer needed. Perplexity does not report "
-            "usage for cancelled runs, so this cannot tell you whether it changed your "
-            "bill."
+            "Ask Perplexity to stop a research run that is no longer needed. Perplexity "
+            "does not report usage for cancelled runs, so this cannot tell you whether "
+            "it changed your bill."
         ),
         "inputSchema": {
             "type": "object",
