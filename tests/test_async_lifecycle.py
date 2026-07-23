@@ -334,7 +334,14 @@ class TestCancelTool(LifecycleTestCase):
                 srv.tool_cancel({"response_id": "resp_x"}, None)
         self.assertIsNone(ctx.exception.status)
 
-    def test_unknown_id_is_an_error(self) -> None:
+    def test_a_404_is_an_error(self) -> None:
+        """Only a 400 is benign; every other status still raises.
+
+        Perplexity's docs say an unknown or cross-tenant id surfaces as 404.
+        Live probing showed it does not — it returns 400, which the test above
+        covers. This keeps the 404 path pinned anyway: the docs may yet become
+        true, and if they do, a 404 must not be quietly swallowed as benign.
+        """
         self.fake.script((404, {"error": {"message": "not found"}}))
         with self.assertRaises(srv.PerplexityError):
             srv.tool_cancel({"response_id": "resp_x"}, None)

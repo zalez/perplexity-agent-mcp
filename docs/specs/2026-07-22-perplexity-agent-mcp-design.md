@@ -17,11 +17,10 @@ runs alongside it.
 
 **The product is auditability.** A reader must be able to open one file, read it
 top to bottom in one sitting, and be certain it does nothing surprising. (The
-original brief said five minutes; at the shipped size that is optimistic — see §5.1.)
-Every
-design decision below resolves in favour of that property. The server holds an API
-key and talks to the network on the user's behalf — it is a trust boundary, so it
-must have no foreign supply chain to attack.
+original brief said five minutes; at the shipped size that is optimistic — see
+§5.1.) Every design decision below resolves in favour of that property. The
+server holds an API key and talks to the network on the user's behalf — it is a
+trust boundary, so it must have no foreign supply chain to attack.
 
 ## 2. Non-goals
 
@@ -296,12 +295,19 @@ synthesizing"*. Where no partial items exist yet, it degrades to the bare status
 
 ### 6.3 `perplexity_agent_cancel` — abandon a run
 
+- **title:** `Cancel Perplexity Research`
 - **annotations:** `{"readOnlyHint": false, "destructiveHint": true,
   "idempotentHint": false, "openWorldHint": true}`
   — honest: it terminates work, and a second call on a terminal run returns 400.
-- **description:** Stop a research run started with `wait: false` that is no longer
-  needed. Perplexity does not report usage for cancelled runs, so this tool
-  **cannot** tell you whether it reduced your bill (D15).
+- **description (as shipped):** Ask Perplexity to stop a research run that is no
+  longer needed. Perplexity does not report usage for cancelled runs, so this
+  cannot tell you whether it changed your bill.
+
+  Two words here are deliberate. **"Ask"**, not "stop": cancellation is
+  asynchronous — a 200 means the request was accepted, not that the run has
+  ended — and §3.4 established that we cannot confirm what actually happened
+  either way. **"Changed"**, not "reduced": claiming a reduction would invent a
+  billing effect the API never reports (D15).
 
 ```json
 {
@@ -374,13 +380,33 @@ _poll(id, budget = min(wait_seconds, WAIT_SECONDS))
 
 ```
 validate response_id
+derive one end-to-end deadline from the wait budget, as tool_agent does
 POST /v1/agent/{id}/cancel
-  ├─ 200 → "cancellation requested" (says nothing about billing — D15)
-  ├─ 400 → "already finished or already cancelled"  (isError: false — benign)
-  └─ 404 → "unknown response_id"                    (isError: true)
-        NOTE: verified 2026-07-23 that Perplexity returns 400, not 404, for an
-        id that was never issued — indistinguishable from a terminal run. See 3.4.
+  ├─ 200 → "cancellation requested"   (isError: false; nothing about billing — D15)
+  ├─ 400 → "the run is not running now, and this same response is what you get
+  │         whether it finished or the id never existed — verify with
+  │         perplexity_agent_result before assuming this cancelled it"
+  │                                    (isError: false — see below)
+  └─ anything else — 401, 403, 5xx, a network failure, and a 404 if one ever
+     occurs                            (isError: true)
 ```
+
+**The branch is chosen on the HTTP status, never on the message text.** Matching
+prose would be wrong in both directions: this module's own no-body fallback for a
+400 (`"Perplexity returned HTTP 400."`) contains neither "already" nor "terminal"
+and would wrongly raise, while a 401 body that merely happens to contain the word
+— `"Your API key has already been revoked"` — would wrongly report a failed,
+unauthenticated call as a successful cancellation. `status` is populated only from
+an `HTTPError`, so a network failure leaves it `None` and correctly raises.
+
+**Why 400 is `isError: false` even though it may mean "no such run".** §3.4
+established that Perplexity returns an identical 400 for a genuinely-terminal run
+and for an id that was never issued. Since the two cannot be told apart, the
+handler asserts only what holds under both causes — the run is not running now —
+and defers to `perplexity_agent_result` instead of guessing. Raising instead would
+make the common case (cancelling something that just finished) look like a
+failure; claiming a confirmed cancellation would be worse still, because a caller
+that mistyped an id would stop trying while a billable run continued.
 
 ### 8.4 The shared poll loop
 
@@ -518,10 +544,10 @@ surfaced, but never headers and never a raw traceback.
 
 | File | Covers |
 |---|---|
-| `tests/fake_perplexity.py` | stdlib `http.server` double: completed / failed / incomplete / slow responses, **scripted `queued` → `in_progress` (partial `output`) → `completed` transitions** per §3.4, 401, 429, 5xx, malformed JSON, unknown-field envelope, cancel returning 200 / 400 / 404 |
+| `tests/fake_perplexity.py` | stdlib `http.server` double: completed / failed / incomplete / slow responses, **scripted `queued` → `in_progress` (partial `output`) → `completed` transitions** per §3.4, 401, 429, 5xx, malformed JSON, unknown-field envelope, cancel returning 200 / 400 (with and without a body) / 404 |
 | `tests/test_mcp_protocol.py` | Drives the real server as a subprocess over real pipes. Every row of §10. Version negotiation. Notifications get no reply. EOF exits 0. All three tools listed with correct annotations. |
 | `tests/test_perplexity_client.py` | Request body shape, filter nesting, poll loop, retry/backoff, answer reconstruction, source dedupe, tolerant parsing |
-| `tests/test_async_lifecycle.py` | `wait=false` returns an id immediately; `wait=true` budget expiry returns id + progress and **does not cancel** (D13); `_result` on an in-progress run is `isError: false` with a progress summary; `_result` `wait_seconds` blocks then returns; `_cancel` 400 is benign and 404 is an error; progress summaries contain counts only, never source text |
+| `tests/test_async_lifecycle.py` | `wait=false` returns an id immediately; `wait=true` budget expiry returns id + progress and **does not cancel** (D13); `_result` on an in-progress run is `isError: false` with a progress summary; `_result` `wait_seconds` blocks then returns; `_cancel` treats **any** 400 as benign — a finished run, a bodyless 400, and a never-issued id all take the same path (§3.4) — while 404 and network failures raise; progress summaries contain counts only, never source text |
 | `tests/test_perplexity_client.py::TestSpotlighting` | Wrapper structure, nonce randomness, closing-tag strip, answer-inside-wrapper. (Planned as a separate file; the tests live alongside the other parsing tests.) |
 | `tests/test_no_dependencies.py` | AST walk asserting every import resolves to a stdlib allowlist; `pyproject.toml` `dependencies == []` (skipped on 3.10, which lacks `tomllib`) |
 | `tests/test_no_secrets.py` | Key never appears in stdout, stderr, or any error message; no `pplx-` pattern anywhere in the tree |
