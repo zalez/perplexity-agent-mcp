@@ -1,7 +1,7 @@
 # Design: `perplexity-agent-mcp`
 
 **Date:** 2026-07-22
-**Status:** Approved, pending implementation
+**Status:** Implemented and verified — see §17.
 **Author:** Constantin Gonzalez (with Claude)
 
 ---
@@ -668,3 +668,38 @@ failure mode it prevents: a future agent helpfully adding `requests`, or
 - `structuredContent` alongside the text block.
 - PyPI publication.
 - Exposing `instructions` (system prompt) or `finance_search` / `people_search`.
+
+---
+
+## 17. Verification against the acceptance criteria
+
+Run 2026-07-23 against the live Perplexity Agent API, on the implementation at
+commit `d9bae77`. Every criterion in §15 was exercised for real; nothing here is
+inferred from tests.
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Server starts and blocks on stdin | **Pass.** EOF exits 0. |
+| 2 | Self-test drives `initialize` → `notifications/initialized` → `tools/list` → `tools/call`, returning real answer text plus a source URL | **Pass.** `preset=fast` returned 1 857 characters and **10 source URLs**, wrapped in a `<untrusted-web-content-…>` delimiter with a 16-hex-character (64-bit) nonce. The notification correctly drew no response. |
+| 2b | Async lifecycle across separate calls | **Pass.** `wait: false` returned a `response_id` immediately. `perplexity_agent_result` on the still-running job returned `isError: false` with `status queued after 0s` and the exact follow-up call. Collecting with `wait_seconds: 50` returned the finished answer: **53 sources, 11 936 characters.** |
+| 3 | Missing `PERPLEXITY_API_KEY` → clean tool error | **Pass.** `isError: true`, names the variable and where to set it, no traceback. |
+| 4 | Non-2xx from Perplexity → readable error, server survives | **Pass.** An invalid preset returned Perplexity's own message; a subsequent `ping` was answered, proving the read loop lived. |
+| 5 | No third-party imports; key never written to stdout or a log | **Pass.** Enforced by `tests/test_no_dependencies.py` and `tests/test_no_secrets.py`; stderr was empty across every live run. |
+| 6 | Works via either install path | **Partial.** Path A verified live throughout. Path B's wheel was built, installed into a clean venv, and driven over real pipes; the `uvx --from git+https://…` form cannot be exercised until the repo is public and `v0.1.0` is tagged. |
+| 7 | Full CI green on all supported Pythons | **Pass.** 8/8 jobs on real GitHub runners: 3.10, 3.11, 3.12, 3.13, 3.14, lint+types, pre-commit (gitleaks/zizmor/hygiene), packaging smoke test. |
+| 8 | `pre-commit run --all-files` green and matching CI | **Pass.** 18 hooks; parity enforced by `tests/test_tooling_parity.py`. |
+
+### What live verification found that testing did not
+
+`perplexity_agent_cancel` on a **never-issued** `response_id` returned
+`isError: false` — "already finished or was already cancelled" — because
+Perplexity answers **400** for an unknown id, not the documented 404, with the
+identical message a genuinely terminal run produces. A model that mistyped an id
+would have been told the cancellation succeeded while a billable run continued.
+
+Nothing in the response distinguishes the two cases, so this could not be fixed
+with better logic. The tool's wording now states the ambiguity and points the
+caller at `perplexity_agent_result` to confirm. Recorded in §3.4, in the §10
+error table, and in `CLAUDE.md`.
+
+**Cost of verification:** roughly $0.15 across six live runs.
