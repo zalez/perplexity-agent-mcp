@@ -1,0 +1,12 @@
+# There are no runtime dependencies to update — that is the point of this
+# project. Actions are the one supply chain we do have, so watch those.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    cooldown:
+      default-days: 7
