@@ -16,7 +16,9 @@ Search API. It cannot reach the Agent API. This server fills exactly that gap an
 runs alongside it.
 
 **The product is auditability.** A reader must be able to open one file, read it
-top to bottom in five minutes, and be certain it does nothing surprising. Every
+top to bottom in one sitting, and be certain it does nothing surprising. (The
+original brief said five minutes; at the shipped size that is optimistic — see §5.1.)
+Every
 design decision below resolves in favour of that property. The server holds an API
 key and talks to the network on the user's behalf — it is a trust boundary, so it
 must have no foreign supply chain to attack.
@@ -44,7 +46,7 @@ findings and they drive the design.
 | Fact | Value |
 |---|---|
 | Current stable revision | **`2025-11-25`** |
-| Next revision | `2026-07-28` — final in 6 days, removes `initialize` entirely, adds `server/discover`, protocol becomes stateless |
+| Next revision | `2026-07-28` (dated five days after this design was written) — removes `initialize` entirely, adds `server/discover`, protocol becomes stateless |
 | stdio framing | Newline-delimited JSON, UTF-8. **Unchanged** in the new revision. No `Content-Length` framing (that's LSP, not MCP). |
 | JSON-RPC batching | **Removed** in `2025-06-18`. A line parsing to an array is invalid. |
 | Validation errors | **`isError: true`, NOT `-32602`** — flipped in `2025-11-25` (SEP-1303) so models can self-correct. |
@@ -201,9 +203,11 @@ dispatch()
 main()
 ```
 
-Target revised to ~330 lines: three tools and the shared poll loop cost roughly
-70 lines over the single-tool draft. Still one screen per band, still auditable in
-one sitting.
+Target at design time was ~330 lines. **The shipped file is 1417.** The gap is
+almost entirely comments and the hardening that review added — the executable core
+stayed close to the estimate, but every empirically-discovered API quirk, security
+rationale, and non-obvious constraint earned a comment explaining *why*. Recorded
+here rather than quietly revised: an estimate that missed by 4x is worth knowing about.
 
 ## 6. The tools
 
@@ -517,7 +521,7 @@ surfaced, but never headers and never a raw traceback.
 | `tests/test_mcp_protocol.py` | Drives the real server as a subprocess over real pipes. Every row of §10. Version negotiation. Notifications get no reply. EOF exits 0. All three tools listed with correct annotations. |
 | `tests/test_perplexity_client.py` | Request body shape, filter nesting, poll loop, retry/backoff, answer reconstruction, source dedupe, tolerant parsing |
 | `tests/test_async_lifecycle.py` | `wait=false` returns an id immediately; `wait=true` budget expiry returns id + progress and **does not cancel** (D13); `_result` on an in-progress run is `isError: false` with a progress summary; `_result` `wait_seconds` blocks then returns; `_cancel` 400 is benign and 404 is an error; progress summaries contain counts only, never source text |
-| `tests/test_spotlighting.py` | Wrapper structure, nonce randomness, closing-tag strip, answer-inside-wrapper |
+| `tests/test_perplexity_client.py::TestSpotlighting` | Wrapper structure, nonce randomness, closing-tag strip, answer-inside-wrapper. (Planned as a separate file; the tests live alongside the other parsing tests.) |
 | `tests/test_no_dependencies.py` | AST walk asserting every import resolves to a stdlib allowlist; `pyproject.toml` `dependencies == []` (skipped on 3.10, which lacks `tomllib`) |
 | `tests/test_no_secrets.py` | Key never appears in stdout, stderr, or any error message; no `pplx-` pattern anywhere in the tree |
 | `tests/test_tooling_parity.py` | `ruff`/`mypy` versions pinned identically in `.pre-commit-config.yaml` and `ci.yml` |
