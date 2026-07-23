@@ -373,6 +373,8 @@ POST /v1/agent/{id}/cancel
   ├─ 200 → "cancellation requested" (says nothing about billing — D15)
   ├─ 400 → "already finished or already cancelled"  (isError: false — benign)
   └─ 404 → "unknown response_id"                    (isError: true)
+        NOTE: verified 2026-07-23 that Perplexity returns 400, not 404, for an
+        id that was never issued — indistinguishable from a terminal run. See 3.4.
 ```
 
 ### 8.4 The shared poll loop
@@ -493,7 +495,7 @@ Answer and source list are truncated to a documented cap so a runaway
 | `status: "failed"` | `isError: true`, surfacing upstream `error.message` |
 | **Run still in progress** (`_result`, or `_agent` budget expired) | **`isError: false`** — a legitimate state. Returns id, progress summary, suggested delay. Marking it an error invites the caller to restart the whole run. |
 | Cancel on an already-terminal run (upstream 400) | **`isError: false`** — the goal state is already achieved; this is benign, not a failure |
-| Cancel with an unknown / foreign id (upstream 404) | `isError: true` |
+| Cancel with an unknown / never-issued id | **Also upstream 400** — see 3.4. Indistinguishable from an already-terminal run; the tool's wording says so rather than claiming a confirmed cancellation. A genuine 404, if it ever occurs, is `isError: true`. |
 | `status: "incomplete"` | Partial answer **plus an explicit note** — half an answer silently presented as whole is the worst outcome |
 | Unhandled exception in tool body | `isError: true` |
 | Unhandled exception in dispatcher | `-32603` |

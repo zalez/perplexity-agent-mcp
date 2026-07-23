@@ -105,7 +105,8 @@ happens *inside* a tool that was found and dispatched correctly.
 | `status: "failed"` | `isError: true`, surfacing upstream `error.message` |
 | **Run still in progress** (`_result`, or `_agent`'s wait budget expired) | **`isError: false`** — a legitimate state, not a failure. Returns the id, a progress summary, and the follow-up call to make. Marking it an error would invite the caller to restart the whole run. |
 | Cancel on an already-terminal run (upstream 400) | **`isError: false`** — the goal state is already achieved; benign, not a failure |
-| Cancel with an unknown / foreign id (upstream 404) | `isError: true` |
+| Cancel with an unknown / never-issued id | **Also upstream 400**, byte-identical to the line above. Perplexity's docs claim 404; live probing on 2026-07-23 (a never-issued UUID and a nonsense id) returned 400 with the same `"the run is already terminal"` message a real terminal run gets. **Nothing in the response distinguishes the two cases**, so the tool's wording says so rather than asserting a cancellation it cannot confirm. Do not "fix" this by inferring the difference — the information is not there. |
+| Cancel with a genuinely foreign id (upstream 404, if it ever occurs) | `isError: true` |
 | `status: "incomplete"` | Partial answer **plus an explicit leading note** — a half answer silently presented as whole is the worst outcome |
 | Unhandled exception inside a tool body | `isError: true` (never a traceback) |
 | Unhandled exception in the dispatcher itself | `-32603` |
