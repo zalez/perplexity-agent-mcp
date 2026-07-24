@@ -89,7 +89,7 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
       - name: Install pre-commit
-        run: pip install pre-commit==4.5.1
+        run: pip install pre-commit==4.6.1
       - name: Run every hook that isn't already covered by another job
         # This is the point of the job: 14 of the 18 hooks in
         # .pre-commit-config.yaml (gitleaks, zizmor, actionlint, codespell,

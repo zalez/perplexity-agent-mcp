@@ -1,0 +1,93 @@
+name: Pin check
+
+# Dev-tool pins go stale silently. Dependabot watches GitHub Actions and
+# nothing else, because there are no runtime dependencies to watch — so the
+# hooks in .pre-commit-config.yaml and the tool versions in ci.yml only get
+# updated when somebody happens to look. A stale security scanner reports
+# clean, which is indistinguishable from a clean repo.
+#
+# This nags; it does not fix. It deliberately does NOT run
+# `pre-commit autoupdate`: that resolves to the newest tag on each upstream's
+# default branch rather than its newest release, and on this repo it proposed
+# downgrading gitleaks v8.30.1 -> v8.30.0. See .github/scripts/check_pins.py.
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC. Weekly is enough for a drift measured in weeks.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check dev-tool pins
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The only elevated permission in this repo, and it is scoped to this one
+      # job: enough to file a reminder, not enough to change any code.
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Compare every pin against its upstream latest release
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check_pins.py | tee "$RUNNER_TEMP/report.md"
+
+      - name: Open or update the tracking issue
+        if: steps.check.outputs.stale == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Dev-tool pins have fallen behind"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            cat "$RUNNER_TEMP/report.md"
+            echo
+            echo "---"
+            echo "Filed automatically by [\`pin-check\`]($RUN_URL). This issue is"
+            echo "rewritten in place each run and closes itself once every pin is"
+            echo "current, so it will not accumulate comments."
+          } > "$RUNNER_TEMP/body.md"
+
+          existing=$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title \
+            --jq "[.[] | select(.title == env.TITLE)][0].number // empty")
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file "$RUNNER_TEMP/body.md"
+            echo "updated issue #$existing"
+          else
+            gh issue create --title "$TITLE" --label dependencies \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Close the tracking issue once everything is current
+        if: steps.check.outputs.stale == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Dev-tool pins have fallen behind"
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title \
+            --jq "[.[] | select(.title == env.TITLE)][0].number // empty")
+
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" \
+              --comment "Every dev-tool pin now matches its upstream latest release."
+            echo "closed issue #$existing"
+          else
+            echo "all pins current, no open issue"
+          fi
