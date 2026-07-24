@@ -37,6 +37,26 @@ exactly how a change passes locally and then fails CI, or the reverse — it
 happened once already on this project, which is why it's a test now instead
 of a memory. If you bump one file's pin, bump the other in the **same PR**.
 
+**Pins are checked weekly, but never bumped automatically.** The `pin-check`
+workflow compares every dev-tool pin against its upstream *latest release* and
+files a single tracking issue when one falls behind, rewriting that issue in
+place and closing it once everything is current. It does not open PRs and holds
+no write access to the code.
+
+Run it yourself any time:
+
+```bash
+GITHUB_TOKEN=$(gh auth token) python3 .github/scripts/check_pins.py
+```
+
+**Do not use `pre-commit autoupdate` on this repo.** It resolves each hook to
+the newest tag reachable from that project's default branch, which is not the
+same as its newest release. Run here on 2026-07-23 it proposed
+`gitleaks v8.30.1 -> v8.30.0` — silently downgrading a secret scanner, because
+upstream cut v8.30.1 on a commit that had diverged from `master`. Nothing about
+the resulting diff looks wrong, and no test would have caught it. Bump by hand
+against the release page instead; that is what `check_pins.py` reads.
+
 ## The invariants a PR must not break
 
 These come from the implementation plan's Global Constraints and apply to
