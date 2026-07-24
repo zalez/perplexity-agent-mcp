@@ -3,6 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    # Tags are load-bearing here: the documented install path pins one
+    # (`uvx --from git+https://…@vX.Y.Z`), so the tagged ref is what users
+    # actually fetch. Branch protection already means a tag can only point at
+    # a commit CI validated on main — this runs the suite against the tag
+    # itself, including the packaging job that builds and drives a real wheel.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -44,7 +50,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install pinned tools
-        run: pip install ruff==0.15.22 mypy==2.3.0
+        run: pip install ruff==0.16.0 mypy==2.3.0
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy --strict perplexity_agent_mcp.py
@@ -60,6 +66,24 @@ jobs:
         with:
           python-version: "3.14"
       - name: Cache pre-commit environments
+        # zizmor's cache-poisoning audit fires here as soon as this workflow
+        # triggers on tags, because a poisoned cache entry feeding a release
+        # build could taint a published artifact. Suppressed deliberately, on
+        # three grounds — re-check all three before assuming this still holds:
+        #
+        #   1. Skipped on tags outright (the `if:` below), so a release run
+        #      never reads this cache. zizmor is static and cannot see that.
+        #   2. Fork PRs cannot write to this repo's Actions cache, so the
+        #      entry is not reachable by an outside attacker.
+        #   3. Writing it therefore requires push access — and anyone with
+        #      push access can change the workflow directly, so poisoning the
+        #      cache buys them nothing they do not already have.
+        #
+        # Cost of removing it instead: measured 70s cold vs 5s warm, on every
+        # PR, to defend against an attacker who by definition already won.
+        # Note this job holds no secrets and runs `contents: read`.
+        # zizmor: ignore[cache-poisoning]
+        if: github.ref_type != 'tag'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/pre-commit
@@ -90,6 +114,12 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          # This job builds the artifact users install, so it gets a clean room:
+          # nothing from a shared cache can reach the wheel. Costs almost
+          # nothing here — there are zero runtime dependencies, so the only
+          # download is the flit_core build backend.
+          enable-cache: false
       - name: Build the wheel
         run: uv build
       - name: Install it into a clean environment and drive the console script
