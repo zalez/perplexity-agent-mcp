@@ -512,7 +512,20 @@ we chose delimiting over the paper's recommended datamarking (D10) and why.
 ### 9.6 Output bounding
 
 Answer and source list are truncated to a documented cap so a runaway
-`wide-research` run cannot blow up the client's context window.
+`wide-research` run cannot blow up the client's context window. Every cut is
+marked with an ellipsis, so a chopped string can never quietly pass as a
+complete one.
+
+**URLs are cut differently from prose.** Titles, answers and status words keep
+their head and drop the rest, which is how text reads. A URL's identity usually
+lives at its *far end* — the article slug, the document id, the query that
+selects the resource — so head-truncating two citations from the same site
+rendered them byte-identical, and a reader could not tell which was which even
+though the two sources were correctly kept apart internally (dedup keys on the
+full URL, before truncation). `_truncate_url` therefore keeps both ends. That
+makes a collision unlikely rather than impossible: two URLs sharing a long head
+*and* a long tail still render alike, and a truncated URL is a broken citation
+either way.
 
 ## 10. Error handling
 

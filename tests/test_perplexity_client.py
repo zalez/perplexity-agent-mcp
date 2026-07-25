@@ -536,7 +536,17 @@ class TestParsing(unittest.TestCase):
         }
         url = srv._extract_sources(payload)[0]["url"]
         self.assertEqual(len(url), srv._MAX_URL_CHARS)
-        self.assertTrue(url.endswith("…"), "truncation must be visible, not silent")
+        # This asserted `endswith("…")` while URLs were head-truncated. URLs
+        # now keep both ends, so the ellipsis sits in the middle and the
+        # position is no longer the point — visibility is. To keep this from
+        # being a strictly weaker check, the assertion below pins the actual
+        # new shape: an ellipsis present, and NOT at the end, which is what
+        # plain head-truncation would have produced.
+        self.assertIn("…", url, "truncation must be visible, not silent")
+        self.assertFalse(
+            url.endswith("…"),
+            "a URL should keep its tail; see _truncate_url",
+        )
 
     def test_source_dedup_uses_the_full_url_not_the_truncated_one(self) -> None:
         """Two distinct URLs that share an identical first _MAX_URL_CHARS
@@ -557,6 +567,47 @@ class TestParsing(unittest.TestCase):
         }
         sources = srv._extract_sources(payload)
         self.assertEqual(len(sources), 2)
+
+    def test_two_urls_sharing_a_long_prefix_still_render_differently(self) -> None:
+        """The test above proves dedup keeps these apart INTERNALLY. This one
+        proves a reader can tell them apart in the rendered citation list.
+
+        Head-truncating two URLs from the same site produced byte-identical
+        output — same visible text, different destinations — so a reader had
+        no way to know which citation was which. The tail is kept for exactly
+        this reason: it is where a long URL's identity usually lives.
+        """
+        prefix = "https://example.com/" + "a" * srv._MAX_URL_CHARS
+        payload: dict[str, object] = {
+            "output": [
+                {
+                    "type": "search_results",
+                    "results": [
+                        {"url": prefix + "/first-article", "title": "One"},
+                        {"url": prefix + "/second-article", "title": "Two"},
+                    ],
+                }
+            ]
+        }
+        rendered = [s["url"] for s in srv._extract_sources(payload)]
+        self.assertEqual(len(rendered), 2)
+        self.assertNotEqual(
+            rendered[0],
+            rendered[1],
+            "two different sources rendered as the same string; a reader "
+            "cannot tell which citation is which",
+        )
+
+    def test_truncated_url_keeps_both_ends(self) -> None:
+        """Head identifies the site, tail identifies the page. Keep both."""
+        url = "https://example.com/" + "a" * srv._MAX_URL_CHARS + "/the-actual-page"
+        payload: dict[str, object] = {
+            "output": [{"type": "search_results", "results": [{"url": url, "title": "t"}]}]
+        }
+        rendered = srv._extract_sources(payload)[0]["url"]
+        self.assertTrue(rendered.startswith("https://example.com/"))
+        self.assertTrue(rendered.endswith("the-actual-page"))
+        self.assertEqual(len(rendered), srv._MAX_URL_CHARS)
 
     def test_parsing_tolerates_missing_and_unknown_fields(self) -> None:
         self.assertEqual(srv._extract_sources({}), [])
