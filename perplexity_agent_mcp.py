@@ -233,6 +233,32 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
+def _truncate_url(url: str, limit: int) -> str:
+    """Cut a URL to `limit` characters, keeping BOTH ends.
+
+    Prose reads left to right, so `_truncate` above keeps the head and drops
+    the rest. A URL is not prose: the part that identifies *which page* is
+    usually at the far end — the article slug, the document id, the query that
+    actually selects the resource. Head-truncating two citations from the same
+    site therefore rendered them byte-identical, so a reader could not tell
+    which was which even though the two sources were correctly kept apart
+    internally (dedup keys on the full URL, before truncation).
+
+    Keeping the tail makes that collision unlikely. **Not impossible** — two
+    URLs sharing both a long head and a long tail still render alike. A
+    truncated URL is a broken citation either way (see `_MAX_URL_CHARS`); this
+    only ensures a reader can usually still tell two broken citations apart.
+
+    Assumes `limit >= 1`, which every caller satisfies from a module constant.
+    """
+    if len(url) <= limit:
+        return url
+    keep = limit - 1  # one character goes to the ellipsis
+    head = keep - keep // 3  # ~2/3 head: enough to identify the site and path
+    tail = keep - head  # ~1/3 tail: where the page's identity usually lives
+    return url[:head] + "…" + url[len(url) - tail :]
+
+
 def _error_message(payload: dict[str, object], status: int) -> str:
     """Pull a human-readable message out of an upstream error body.
 
@@ -473,7 +499,7 @@ def _extract_sources(payload: dict[str, object]) -> list[dict[str, str]]:
             title_text = title if isinstance(title, str) else url
             sources.append(
                 {
-                    "url": _truncate(url, _MAX_URL_CHARS),
+                    "url": _truncate_url(url, _MAX_URL_CHARS),
                     "title": _truncate(title_text, _MAX_TITLE_CHARS),
                 }
             )
