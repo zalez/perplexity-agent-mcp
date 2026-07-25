@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.2.0] - 2026-07-24
+
+### Added
+
+- **An optional `llm` plugin.** `llm -m perplexity-agent 'your question'`
+  exposes the Perplexity Agent API as a model for Simon Willison's
+  [`llm`](https://llm.datasette.io) CLI, with `-o preset`, `-o recency`,
+  `-o domains`, `-o timeout` and `-o spotlight`. Install with the `llm` extra;
+  the MCP server never imports it and still has zero runtime dependencies.
+  It exists because `llm` has no MCP support (simonw/llm#696, open since
+  January 2025) and `llm-perplexity` wraps only the older Sonar chat models.
+- Poll progress on stderr during a run, so a long query does not look hung and
+  the answer still pipes cleanly.
+
+### Changed
+
+- **The server no longer claims stdout when merely imported.** Rebinding
+  `sys.stdout` moved from import time into `main()`. Importing the module used
+  to redirect the whole importing program's output to stderr — harmless for
+  the server, fatal for anything reusing the client, including the new
+  adapter. The guarantee for the server itself is unchanged: `main()` claims
+  stdout before any protocol traffic moves.
+- **Build backend is now `setuptools`, was `flit_core`.** flit builds exactly
+  one module per distribution and this project now ships two. setuptools is
+  the only backend that keeps the property flit was chosen for — one package,
+  zero transitive dependencies. `__version__` remains the single source of
+  truth.
+- Source URLs now keep both ends when truncated, so two long citations from
+  the same site no longer render identically.
+
+### Fixed
+
+- `perplexity_agent_cancel`'s message no longer implies a cancellation it
+  cannot confirm: Perplexity returns an identical HTTP 400 whether a run had
+  already finished or the id never existed.
+
 ## [0.1.0] - 2026-07-23
 
 Initial release.

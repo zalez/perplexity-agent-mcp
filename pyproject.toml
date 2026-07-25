@@ -4,15 +4,22 @@
 # transitive dependencies (hatchling pulls five), and because it reads the
 # version and description straight out of the module — so they cannot drift.
 
+# setuptools, not flit_core. flit was the original choice because it resolves
+# to exactly one package with zero transitive dependencies — but it builds
+# exactly ONE module per distribution, and this project now ships two: the MCP
+# server and the optional `llm` plugin adapter. setuptools is the only backend
+# that keeps the property flit was chosen for (still one package, still zero
+# transitive dependencies) while shipping both. hatchling would have cost five.
 [build-system]
-requires = ["flit_core>=3.2,<4"]
-build-backend = "flit_core.buildapi"
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "perplexity-agent-mcp"
 requires-python = ">=3.10"
 dependencies = []
-dynamic = ["version", "description"]
+dynamic = ["version"]
+description = "Zero-dependency MCP server and llm plugin for Perplexity's Agent API."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Constantin Gonzalez", email = "constantin@glez.de" }]
@@ -34,11 +41,28 @@ classifiers = [
 Homepage = "https://github.com/zalez/perplexity-agent-mcp"
 Issues = "https://github.com/zalez/perplexity-agent-mcp/issues"
 
+[project.optional-dependencies]
+# Only needed to use the `llm` CLI adapter. The MCP server itself has, and
+# will always have, zero runtime dependencies.
+llm = ["llm>=0.27"]
+
 [project.scripts]
 perplexity-agent-mcp = "perplexity_agent_mcp:main"
 
-[tool.flit.module]
-name = "perplexity_agent_mcp"
+[project.entry-points.llm]
+# Registers the model with Simon Willison's `llm`. Inert unless llm is
+# installed, so this costs MCP-only users nothing.
+perplexity_agent = "perplexity_agent_llm"
+
+[tool.setuptools]
+# Two top-level modules, no package directory: the MCP server stays a single
+# file you can read end to end, and the llm adapter sits beside it.
+py-modules = ["perplexity_agent_mcp", "perplexity_agent_llm"]
+
+[tool.setuptools.dynamic]
+# Still one source of truth for the version: the module's own __version__.
+# setuptools AST-parses this rather than importing it.
+version = { attr = "perplexity_agent_mcp.__version__" }
 
 [tool.ruff]
 line-length = 100
@@ -77,6 +101,22 @@ warn_unreachable = true
 # found on the host interpreter but with no stub certified for that version) —
 # both are disabled here rather than just one so the outcome doesn't depend on
 # which path mypy happens to take.
+# `llm` is an optional extra. Whole-tree `mypy --strict .` must stay clean on a
+# checkout that has not installed it, which is the normal state for anyone
+# using only the MCP server.
+# With `llm` absent it resolves to Any, so --strict objects to subclassing it
+# and to its untyped decorator. Those two checks are meaningless without the
+# package and meaningful with it, so they are relaxed HERE only and the real
+# check runs in CI's `llm-adapter` job, which installs the extra first.
+[[tool.mypy.overrides]]
+module = "perplexity_agent_llm"
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["llm", "llm.*", "pydantic", "pydantic.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = "tests.test_no_dependencies"
 disable_error_code = ["import-not-found", "import-untyped"]

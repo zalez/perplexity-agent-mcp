@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 import sys
 import unittest
 
@@ -36,6 +37,11 @@ ALLOWED = frozenset(
         "urllib.request",
     }
 )
+
+
+def _requirement_name(requirement: str) -> str:
+    """Bare distribution name from a PEP 508 requirement string."""
+    return re.split(r"[<>=!~\[; ]", requirement.strip(), maxsplit=1)[0].strip()
 
 
 def _imported_roots(path: pathlib.Path) -> set[str]:
@@ -72,12 +78,56 @@ class TestNoDependencies(unittest.TestCase):
                 self.assertIn(name.split(".")[0], stdlib)
 
     @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
-    def test_pyproject_declares_no_dependencies(self) -> None:
+    def test_pyproject_declares_no_runtime_dependencies(self) -> None:
         import tomllib
 
         data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(data["project"]["dependencies"], [])
-        self.assertNotIn("optional-dependencies", data["project"])
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def test_the_only_optional_dependency_is_the_llm_adapter(self) -> None:
+        """This used to assert `optional-dependencies` was absent entirely.
+
+        The `llm` adapter needs `llm`, so the key now exists — but relaxing
+        the check to "extras are fine" would retire a supply-chain gate
+        rather than adjust it. It instead pins the exact allowed set, so
+        adding any further extra is a deliberate act that shows up here.
+
+        Installing an extra is opt-in and never happens to an MCP user: the
+        server imports nothing from `perplexity_agent_llm`, and the entry
+        point that references it is inert without `llm` installed.
+        """
+        import tomllib
+
+        data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        extras = data["project"].get("optional-dependencies", {})
+        self.assertEqual(sorted(extras), ["llm"], "the only extra may be `llm`")
+        self.assertEqual(
+            [_requirement_name(r) for r in extras["llm"]],
+            ["llm"],
+            "the `llm` extra may depend on `llm` and nothing else",
+        )
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def test_build_backend_stays_a_single_zero_dependency_package(self) -> None:
+        """The build backend is a supply chain too.
+
+        flit_core was chosen because it resolves to exactly one package with
+        no transitive dependencies. It builds only one module per
+        distribution, though, and this project ships two — so it was replaced
+        with setuptools, which is the only backend that keeps that property.
+        Pinned here so a casual switch to something with a dependency tree
+        (hatchling pulls four) is a decision rather than an accident.
+        """
+        import tomllib
+
+        data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        requires = data["build-system"]["requires"]
+        self.assertEqual(
+            [_requirement_name(r) for r in requires],
+            ["setuptools"],
+            "exactly one build dependency, and it must be a zero-transitive one",
+        )
 
 
 if __name__ == "__main__":
