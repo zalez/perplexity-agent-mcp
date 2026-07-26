@@ -55,18 +55,30 @@ from typing import TextIO
 # line corrupts the stream. The client's symptom is a baffling parse error
 # rather than an obvious crash.
 #
-# So: grab the real stdout, then point sys.stdout at stderr. After this, any
-# accidental print() anywhere in the process is harmless noise on stderr.
+# So the server grabs the real stdout and points sys.stdout at stderr, after
+# which any accidental print() anywhere in the process is harmless noise on
+# stderr. `_claim_stdout()` below does that, and `main()` calls it.
 #
-# This sits after the import block, not immediately after the version guard,
-# because a plain (non-dunder) assignment ahead of an import block trips
-# ruff's E402 lint rule. It still runs before __version__ is even defined,
-# i.e. before any of this module's own code could possibly print.
-_STDOUT = sys.stdout
-_STDERR = sys.stderr
-sys.stdout = sys.stderr
+# It is a FUNCTION rather than a module-level statement on purpose. Rebinding
+# sys.stdout as an import side effect would silently redirect the output of
+# any program that merely imports this module — which is exactly what happens
+# when the `llm` plugin adapter reuses the Perplexity client in here. Claiming
+# a process-wide resource is a decision for whoever runs the server, not for
+# whoever imports it. `main()` still calls it before a single byte of protocol
+# traffic moves, so the guarantee for the server is unchanged.
+_STDOUT: TextIO = sys.stdout
+_STDERR: TextIO = sys.stderr
 
-__version__ = "0.1.0"
+
+def _claim_stdout() -> None:
+    """Reserve the real stdout for JSON-RPC and send everything else to stderr."""
+    global _STDOUT, _STDERR
+    _STDOUT = sys.stdout
+    _STDERR = sys.stderr
+    sys.stdout = sys.stderr
+
+
+__version__ = "0.2.0"
 
 # =============================================================================
 # BAND 1 — CONFIG.  Constants only, no logic.
@@ -189,12 +201,18 @@ class PerplexityError(Exception):
         self.status = status
 
 
+# The one environment variable this program reads for credentials. Named as a
+# constant so the `llm` adapter can bridge its own key store to the same
+# variable without duplicating the string.
+_KEY_ENV_VAR = "PERPLEXITY_API_KEY"
+
+
 def _api_key() -> str:
     """Read the key at call time so an unset key is a tool error, not a crash."""
-    key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
+    key = os.environ.get(_KEY_ENV_VAR, "").strip()
     if not key:
         raise PerplexityError(
-            "PERPLEXITY_API_KEY is not set. Add it to the 'env' block of this "
+            f"{_KEY_ENV_VAR} is not set. Add it to the 'env' block of this "
             "server's entry in your MCP client configuration."
         )
     return key
@@ -565,8 +583,15 @@ def _spotlight(body: str) -> str:
     )
 
 
-def _format_answer(payload: dict[str, object]) -> str:
-    """Render a completed run as spotlighted text."""
+def _answer_body(payload: dict[str, object]) -> str:
+    """Render a completed run as plain text: answer, sources, incomplete note.
+
+    Split from `_format_answer` so the two adapters can share one rendering
+    and differ only on whether to wrap it. The MCP server always wraps,
+    because its output goes straight into a model that is holding tools. The
+    `llm` adapter defaults to not wrapping, because its output goes to a
+    terminal for a human to read — see that module for the full reasoning.
+    """
     answer = _extract_answer(payload) or "(Perplexity returned no answer text.)"
     sources = _extract_sources(payload)
     body = answer
@@ -581,7 +606,12 @@ def _format_answer(payload: dict[str, object]) -> str:
             "NOTE: Perplexity marked this run INCOMPLETE; the answer below may be "
             "partial.\n\n" + body
         )
-    return _spotlight(body)
+    return body
+
+
+def _format_answer(payload: dict[str, object]) -> str:
+    """Render a completed run as spotlighted text."""
+    return _spotlight(_answer_body(payload))
 
 
 # --- Running a research job --------------------------------------------------
@@ -1434,6 +1464,11 @@ def main() -> int:
     skips the reconfigure and falls back to the ambient default rather than
     crashing on a missing attribute.
     """
+    # Claim stdout for the protocol before anything can print to it. This used
+    # to run at import time; it moved here so that merely importing this module
+    # no longer redirects the output of the importing program — see
+    # `_claim_stdout`.
+    _claim_stdout()
     if isinstance(sys.stdin, io.TextIOWrapper):
         sys.stdin.reconfigure(errors="replace")
     return serve(sys.stdin)

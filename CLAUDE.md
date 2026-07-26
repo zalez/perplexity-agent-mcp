@@ -33,9 +33,11 @@ Every one of these applies to every change, no exceptions without discussing
 it with the maintainer first. Quoted from the implementation plan's Global
 Constraints:
 
-- **Zero third-party runtime dependencies.** stdlib only. No
-  `requirements.txt`, no MCP SDK, no `pip install` for users. Enforced by
-  `tests/test_no_dependencies.py`.
+- **Zero third-party runtime dependencies** in the server. stdlib only. No
+  `requirements.txt`, no MCP SDK, no `pip install` for users. The optional
+  `llm` extra is the single permitted exception and applies only to
+  `perplexity_agent_llm.py`, which the server never imports. Enforced by
+  `tests/test_no_dependencies.py`, which pins the exact allowed extra.
 - **Python floor `>=3.10`.** No `match` statements requiring 3.11+, no
   `tomllib` in the server itself (3.11+), no PEP 695 generics. Develop on
   3.14.6; CI matrix covers 3.10–3.14.
@@ -44,8 +46,11 @@ Constraints:
   API-key exfiltration vector (SECURITY.md §Network).
 - **The API key is never printed, logged, echoed, or attached to an
   exception.** Read from `PERPLEXITY_API_KEY` at call time, not import time.
-- **stdout is exclusively JSON-RPC.** All logging goes to stderr.
-  `sys.stdout` is rebound to `sys.stderr` at startup.
+- **stdout is exclusively JSON-RPC.** All logging goes to stderr. `main()`
+  calls `_claim_stdout()`, which grabs the real stdout and points
+  `sys.stdout` at stderr. It is deliberately NOT an import-time side effect:
+  the `llm` adapter imports this module, and hijacking stdout on import
+  would redirect that whole program's output. Don't move it back.
 - **MCP protocol revision `2025-11-25`.** Accept `2025-11-25`, `2025-06-18`,
   `2025-03-26`; echo on match, else return `2025-11-25`. Never error on
   version negotiation.
@@ -76,7 +81,7 @@ simpler that turned out to be wrong.
 | D5 | Background + poll upstream, always | One code path for every preset. Each HTTP call is short, so a network blip can't kill a long-running job. |
 | D6 | Params: `query`, `preset`, `recency`, `domains` — never `model` | `anthropic/*` models 400 without `max_output_tokens`, and model ids drift. `preset` tracks Perplexity's own updates instead. |
 | D7 | Full CI gate set, Actions pinned to SHAs | The "zero dependencies" claim must be mechanically enforced, not just asserted. Tag-pinned Actions are a live supply-chain hole. |
-| D8 | `flit_core` build backend | Resolves to one package, zero transitive deps. Reads `__version__` and the module docstring directly — no separate version to drift. |
+| D8 | `setuptools` build backend (was `flit_core`) | flit was chosen for resolving to one package with zero transitive deps — but it builds exactly ONE module per distribution, and the repo now ships two (the server and the optional `llm` adapter). setuptools is the only backend that keeps the property flit was chosen for: still one package, still zero transitive deps. hatchling would have cost five. `__version__` is still the single source of truth, read via `[tool.setuptools.dynamic]`. |
 | D9 | Spotlighting via a randomized delimiter | A *fixed* tag has an obvious break-out (the hostile page just includes the closing tag); a per-response nonce structurally prevents it. |
 | D10 | Delimiting, not datamarking | The paper's stronger recommendation interleaves markers through whitespace, mangling URLs and making answers unquotable — wrong trade for a tool whose output is meant to be read and cited. See SECURITY.md. |
 | D11 | Three tools, not one (`_agent`, `_result`, `_cancel`) | A >60s synchronous call is dead on arrival on Claude Desktop and unfixable by the user. Submit/poll/cancel is one coherent lifecycle, not feature creep. |
@@ -84,6 +89,8 @@ simpler that turned out to be wrong.
 | D13 | A blown deadline hands back an id; it never cancels | Cancel-on-timeout would destroy work already paid for. A blown budget must degrade into the async path, never into nothing. |
 | D14 | Opportunistic `notifications/progress` | Sent only when the request carries a `progressToken`. Pure upside where supported, a no-op elsewhere. |
 | D15 | Never claim cancellation saves money | Cancelled runs report no `usage` and no `cost` at all; the docs are silent on whether you're still billed. The tool says it stops the run and nothing more. |
+| D16 | An optional `llm` adapter, in this repo | `llm` has no MCP support (simonw/llm#696, open since Jan 2025) and `llm-perplexity` wraps only Sonar. Bands 1-3 are already a reusable Perplexity client, so the adapter is a thin second adapter rather than a fork. Same repo because PyPI rejects direct git dependencies, so a separate repo would have forced publishing the core. |
+| D17 | Spotlighting OFF by default in the `llm` adapter | In MCP the answer goes into a model that is holding tools, so injection can cause actions. In `llm -m perplexity-agent` it goes to a terminal for a human, and llm runs no tool loop by default — the realistic risk is a manipulated summary if piped, not a hijacked agent. `-o spotlight true` turns it on. |
 
 ## 3. Error handling
 

@@ -35,6 +35,7 @@ INIT = {
         "clientInfo": {"name": "t", "version": "1"},
     },
 }
+PING = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
 
 
 def _write_unroutable_copy(directory: pathlib.Path) -> pathlib.Path:
@@ -234,37 +235,45 @@ class TestKeyNeverLeaks(unittest.TestCase):
                 self.assertNotIn("_api_key", line)
                 self.assertNotIn("Authorization", line)
 
-    def test_stray_print_is_redirected_to_stderr_not_the_protocol_stream(self) -> None:
-        """Pin the actual defence directly, by its runtime effect, rather
-        than relying solely on the static check above, which an aliased
-        call (`p = print; p(...)`) can evade -- see
-        _forbidden_stdout_writes's own docstring for why that gap can never
-        close statically. Importing the real, unmodified server rebinds
-        sys.stdout to sys.stderr as an import side effect -- see the
-        "stdout discipline" comment at the top of perplexity_agent_mcp.py
-        -- so any print() call anywhere in the process, after that import,
-        lands on stderr no matter how it was written or where it came
-        from, aliased or not.
+    def test_stray_print_during_request_handling_lands_on_stderr(self) -> None:
+        """Pin the actual defence by its runtime effect, rather than relying
+        solely on the static check above, which an aliased call
+        (`p = print; p(...)`) can evade -- see _forbidden_stdout_writes's own
+        docstring for why that gap can never close statically.
 
-        Drives a tiny driver script in a real subprocess: import the real
-        module (runs the rebind), call print() ourselves to stand in for
-        "a stray print() anywhere in the process", then actually run the
-        protocol loop for one request and prove both halves at once: the
-        print()'d text reaches stderr (proving the call genuinely ran and
-        was genuinely redirected -- not just "happened not to appear on
-        stdout" for some unrelated reason), and stdout carries nothing but
-        the one valid JSON-RPC response.
+        `main()` claims the real stdout for the protocol and points
+        sys.stdout at stderr, so any print() anywhere in the process after
+        that lands on stderr no matter how it was written.
+
+        The print is injected into a REQUEST HANDLER rather than at import
+        time, because that is where a stray debugging print actually gets
+        written. (It also matches where the guarantee now begins: claiming
+        stdout moved from import time into `main()` so that merely importing
+        this module no longer redirects the output of the importing program
+        -- see _claim_stdout. The remaining window, between `import` and the
+        `main()` call, is a single statement in the shipped entry points and
+        cannot print.)
+
+        Proves both halves at once: the print()'d text reaches stderr
+        (so the call genuinely ran and was genuinely redirected, rather than
+        merely "not appearing on stdout" for some unrelated reason), and
+        stdout carries nothing but valid JSON-RPC.
         """
         driver = (
             "import sys\n"
             f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
-            "import perplexity_agent_mcp as server\n"  # runs the stdout->stderr rebind
-            f"print({PRINT_SENTINEL!r}, flush=True)\n"  # must land on stderr, not stdout
+            "import perplexity_agent_mcp as server\n"
+            # Stand in for a stray debugging print left inside handler code.
+            "_real_ping = server.handle_ping\n"
+            "def _noisy(params):\n"
+            f"    print({PRINT_SENTINEL!r}, flush=True)\n"
+            "    return _real_ping(params)\n"
+            "server.HANDLERS['ping'] = _noisy\n"
             "raise SystemExit(server.main())\n"
         )
         proc = subprocess.run(
             [sys.executable, "-c", driver],
-            input=json.dumps(INIT) + "\n",
+            input=json.dumps(INIT) + "\n" + json.dumps(PING) + "\n",
             capture_output=True,
             text=True,
             timeout=30,
@@ -279,10 +288,38 @@ class TestKeyNeverLeaks(unittest.TestCase):
         )
         self.assertNotIn(PRINT_SENTINEL, proc.stdout)
 
-        lines = proc.stdout.splitlines()
-        self.assertTrue(lines, "expected the initialize response on stdout")
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2, f"expected exactly two frames, got: {lines}")
         frames = [json.loads(line) for line in lines]
         self.assertEqual(frames[0].get("id"), 1)
+        self.assertEqual(frames[1].get("id"), 2)
+
+    def test_importing_the_module_does_not_touch_process_stdout(self) -> None:
+        """Importing must have no side effect on the importing program.
+
+        Claiming stdout used to happen at import time, which silently
+        redirected the output of ANY program that imported this module --
+        including the `llm` plugin adapter that reuses the Perplexity client
+        in here, where it would have sent every one of that tool's models'
+        output to stderr. Claiming a process-wide resource is a decision for
+        whoever runs the server, not for whoever imports it.
+        """
+        driver = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "import perplexity_agent_mcp\n"
+            "print('STDOUT_INTACT' if sys.stdout is sys.__stdout__ else 'STDOUT_HIJACKED')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", driver],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin"},
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, f"driver crashed; stderr: {proc.stderr}")
+        self.assertIn("STDOUT_INTACT", proc.stdout)
 
 
 class TestKeyStaysOutOfUpstreamRequests(unittest.TestCase):

@@ -87,7 +87,8 @@ parenthetical after each one.
   See [SECURITY.md](SECURITY.md#key-handling) for the full argument and the
   tests that enforce it.
 - **stdout is exclusively JSON-RPC.** All logging goes to stderr.
-  `sys.stdout` is rebound to `sys.stderr` at startup, specifically so a stray
+  `main()` calls `_claim_stdout()`, which rebinds `sys.stdout` to
+  `sys.stderr`, specifically so a stray
   `print()` anywhere in the process — yours, a future contributor's, a
   library's — lands harmlessly on stderr instead of corrupting the protocol
   stream. Don't remove that rebind, and don't add a legitimate reason to
@@ -176,7 +177,7 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
 
 1. Bump `__version__` in `perplexity_agent_mcp.py`. This is the **single
    source of truth** — `pyproject.toml` declares `version` as `dynamic`, and
-   `flit_core` reads it straight out of the module at build time. There is
+   setuptools reads it straight out of the module at build time. There is
    nowhere else to change it.
 2. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
    describing what's in the release.

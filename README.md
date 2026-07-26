@@ -4,7 +4,7 @@
 
 A single-file, zero-third-party-dependency [MCP](https://modelcontextprotocol.io/) server for Perplexity's [Agent API](https://docs.perplexity.ai/docs/agent-api/quickstart) — multi-step web research with citations, exposed to any MCP client over stdio.
 
-Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,417 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
+Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,478 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
 
 ## Why this exists
 
@@ -104,6 +104,56 @@ Two things worth getting right, each the difference between a working config and
 
 > **Use an absolute path to `uvx`.** macOS GUI apps — Claude Desktop launched from Finder or Spotlight, not a terminal — do not inherit your shell's `PATH`. If the config above says `"command": "uvx"`, Claude Desktop very likely can't find it and fails with `spawn uvx ENOENT`. Run `which uvx` in your terminal and paste the absolute path it prints into `command` instead.
 
+## Also: a plugin for `llm`
+
+The same Perplexity Agent client, exposed as a model for Simon Willison's
+[`llm`](https://llm.datasette.io) CLI. Optional — the MCP server never imports
+it and keeps its zero dependencies either way.
+
+```bash
+llm install 'perplexity-agent-mcp[llm] @ git+https://github.com/zalez/perplexity-agent-mcp@v0.2.0'
+llm keys set perplexity        # skip if you already set this for llm-perplexity
+llm -m perplexity-agent 'What changed in MCP 2026-07-28?'
+```
+
+Options mirror the MCP tool:
+
+```bash
+llm -m perplexity-agent -o preset xhigh -o recency week 'Latest on X'
+llm -m perplexity-agent -o domains 'nasa.gov,-reddit.com' 'Artemis status'
+llm -m perplexity-agent -o timeout 600 'Something genuinely deep'
+```
+
+Poll progress goes to **stderr**, so the answer pipes cleanly:
+
+```
+$ llm -m perplexity-agent 'What is MCP?' > answer.md
+[perplexity-agent] status queued after 1s; no intermediate results yet
+[perplexity-agent] status in_progress after 3s; 10 search result(s) gathered
+```
+
+**Why not just point `llm` at the MCP server?** `llm` has no MCP support —
+[simonw/llm#696](https://github.com/simonw/llm/issues/696) has been open since
+January 2025. Third-party bridges exist, but the maintained ones pull in the
+full MCP SDK to talk to a server that deliberately has no dependencies. And
+the existing [`llm-perplexity`](https://pypi.org/project/llm-perplexity/)
+plugin wraps the older Sonar chat models, not the Agent API — the same gap
+this project fills for MCP.
+
+**One deliberate difference from the MCP server: spotlighting is off by
+default here.** In MCP the answer goes straight into a model that is holding
+tools, so injected instructions could cause actions, and the wrapper is
+essential. On the command line the answer goes to a terminal for a human to
+read, and `llm` runs no tool loop by default — so the realistic risk is a
+manipulated summary if you pipe it into another model, not a hijacked agent.
+Turn it on with `-o spotlight true` when the output is headed somewhere that
+matters:
+
+```bash
+llm -m perplexity-agent -o spotlight true 'Research X' | llm -m gpt-5 'Summarise'
+```
+
+
 ## Trust chain: Path A vs Path B
 
 These are not two equally convenient ways to install the same thing. Path B has a strictly larger trust surface than Path A — full stop; that's not a knock on Path B, it's the trade you make for not downloading anything by hand.
@@ -202,7 +252,7 @@ cd perplexity-agent-mcp
 python3 -m unittest discover
 ```
 
-158 tests, pure standard library — `tests/fake_perplexity.py` runs a fake Perplexity over `http.server`, in-process, so nothing real is ever called.
+190 tests, pure standard library — `tests/fake_perplexity.py` runs a fake Perplexity over `http.server`, in-process, so nothing real is ever called.
 
 Before committing, install the git hooks once and let them run automatically after that:
 
