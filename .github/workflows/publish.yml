@@ -1,0 +1,192 @@
+name: Publish
+
+# Three publishes, one trigger, in a required order:
+#
+#   1. perplexity-agent-mcp   — the MCP server
+#   2. llm-perplexity-agent   — the `llm` adapter, which depends on (1) at an
+#                               exact version, so (1) must exist first
+#   3. the MCP Registry entry — which validates that (1) exists and carries an
+#                               `mcp-name:` marker matching server.json
+#
+# Both distributions are built from the same tag at the same version. That is
+# what lets the adapter pin the server exactly instead of guessing a range.
+#
+# The two PyPI publishes are separate jobs with DIFFERENT ENVIRONMENTS, and
+# that is load-bearing rather than stylistic. PyPI identifies a GitHub Trusted
+# Publisher by exactly four fields:
+#
+#     UniqueConstraint("repository_name", "repository_owner",
+#                      "workflow_filename", "environment")
+#
+# Two packages published from one repository and one workflow file therefore
+# collide on that tuple — registering the second pending publisher fails with
+# "a pending trusted publisher matching this configuration has already been
+# registered for a different project name". Giving each its own environment
+# makes the tuples distinct, and has the side benefit that each package can
+# carry its own approval rules.
+#
+# No step uses a stored credential. PyPI uses Trusted Publishing and the
+# registry uses `login github-oidc`, so each mints a short-lived token from
+# this workflow's OIDC identity. There is no API token in this repository, and
+# none to leak, rotate, or forget.
+
+on:
+  push:
+    tags: ["v*"]
+  # Nothing here is safe to run casually, so there is deliberately no
+  # workflow_dispatch: a publish should follow a tag, which follows a review.
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two publishes of the same tag at once.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build and verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          # Same clean-room reasoning as ci.yml's packaging job: this builds
+          # the artifacts people install, so nothing from a shared cache can
+          # reach them.
+          enable-cache: false
+
+      - name: Refuse to publish a tag that disagrees with the source
+        # A tag is just a label; these four numbers are what actually ship. If
+        # any disagree, the wrong version goes out under the right name and
+        # cannot be taken back — PyPI does not allow re-uploading a version, so
+        # a mistake costs that version number permanently. Cheaper to fail here.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          src=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' perplexity_agent_mcp.py)
+          json=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
+          plug=$(python3 -c "import tomllib;print(tomllib.load(open('llm-plugin/pyproject.toml','rb'))['project']['version'])")
+          pin=$(python3 -c "import tomllib;d=tomllib.load(open('llm-plugin/pyproject.toml','rb'));print([x for x in d['project']['dependencies'] if x.startswith('perplexity-agent-mcp')][0])")
+          echo "tag=$tag  __version__=$src  server.json=$json  adapter=$plug  pin=$pin"
+          test "$tag" = "$src"  || { echo "::error::tag $tag != __version__ $src"; exit 1; }
+          test "$tag" = "$json" || { echo "::error::tag $tag != server.json $json"; exit 1; }
+          test "$tag" = "$plug" || { echo "::error::tag $tag != adapter version $plug"; exit 1; }
+          test "$pin" = "perplexity-agent-mcp==$tag" || { echo "::error::adapter pins $pin, not ==$tag"; exit 1; }
+
+      - name: Build both distributions
+        run: |
+          uv build
+          uv build --directory llm-plugin
+
+      - name: Check the artifacts the way PyPI will
+        run: uvx twine check --strict dist/* llm-plugin/dist/*
+
+      # Built once, published from the same bytes. The alternative — rebuilding
+      # inside each publish job — would upload artifacts nothing had checked.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist-server
+          path: dist/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist-adapter
+          path: llm-plugin/dist/
+
+  pypi-server:
+    name: publish perplexity-agent-mcp
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: pypi
+      url: https://pypi.org/p/perplexity-agent-mcp
+    permissions:
+      contents: read
+      # Mints the OIDC token PyPI exchanges for a short-lived upload token.
+      # The only permission beyond read, and it cannot write to this repo.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-server
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+
+  pypi-adapter:
+    name: publish llm-perplexity-agent
+    runs-on: ubuntu-latest
+    # The adapter pins the server exactly, so publishing it first would upload
+    # a package that cannot be resolved.
+    needs: pypi-server
+    environment:
+      # Deliberately NOT `pypi` — see the note at the top of this file. Two
+      # pending publishers in one repo and workflow must differ somewhere, and
+      # this is the field that differs.
+      name: pypi-llm
+      url: https://pypi.org/p/llm-perplexity-agent
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-adapter
+          path: dist/
+
+      - name: Wait for the server to be installable
+        # PyPI's index is not instantly consistent after an upload, and the
+        # adapter's exact pin has to resolve.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "https://pypi.org/pypi/perplexity-agent-mcp/${version}/json" >/dev/null; then
+              echo "perplexity-agent-mcp ${version} is live"
+              exit 0
+            fi
+            echo "attempt ${attempt}: not visible yet, waiting"
+            sleep 10
+          done
+          echo "::error::perplexity-agent-mcp ${version} never appeared on PyPI"
+          exit 1
+
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+
+  registry:
+    name: publish to the MCP Registry
+    runs-on: ubuntu-latest
+    # Only once the package server.json points at actually exists.
+    needs: pypi-adapter
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mcp-publisher
+        # Pinned rather than `latest`: this runs with an OIDC identity able to
+        # publish under our namespace, so the binary should not silently change
+        # between releases.
+        env:
+          MCP_PUBLISHER_VERSION: "1.8.0"
+        run: |
+          set -euo pipefail
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_${os}_${arch}.tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher --version
+
+      # No PyPI wait: pypi-adapter already blocked on the server being served.
+
+      - name: Authenticate
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish

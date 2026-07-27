@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.zalez/perplexity-agent-mcp -->
+
 # perplexity-agent-mcp
 
 [![CI](https://github.com/zalez/perplexity-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/zalez/perplexity-agent-mcp/actions/workflows/ci.yml)
@@ -113,10 +115,16 @@ The same Perplexity Agent client, exposed as a model for Simon Willison's
 it and keeps its zero dependencies either way.
 
 ```bash
-llm install 'perplexity-agent-mcp[llm] @ git+https://github.com/zalez/perplexity-agent-mcp@v0.2.0'
+llm install llm-perplexity-agent
 llm keys set perplexity        # skip if you already set this for llm-perplexity
 llm -m perplexity-agent 'What changed in MCP 2026-07-28?'
 ```
+
+> **Not on PyPI yet.** `llm-perplexity-agent` is built from this repository's
+> [`llm-plugin/`](llm-plugin/) directory and publishes with the next release.
+> Until then, the MCP server above is the working install path. This section
+> is written for the version it will be, rather than a temporary command that
+> contradicts the pinning advice above.
 
 Options mirror the MCP tool:
 

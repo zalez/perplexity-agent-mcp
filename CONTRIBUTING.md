@@ -179,22 +179,46 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
    source of truth for the package version** — `pyproject.toml` declares
    `version` as `dynamic`, and setuptools reads it straight out of the module
    at build time. There is nowhere else to change it.
-2. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
+2. Update `version` in [server.json](server.json) — **twice**: the server's
+   own version and the PyPI package version it points at. The MCP Registry
+   publishes this file, so a stale number advertises a package version that
+   does not exist.
+3. Update [llm-plugin/pyproject.toml](llm-plugin/pyproject.toml) — also
+   **twice**: its own `version`, and the exact `perplexity-agent-mcp==X.Y.Z`
+   pin. The adapter is a second distribution released from the same tag at the
+   same version; the exact pin is what stops it running against a core it was
+   never tested against.
+4. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
    the CHANGELOG's link references at the foot of the file. The README tells
    people to pin a tag rather than track `main`, and that advice is only
    useful if the tag it shows is the current one — a stale pin quietly
    installs an older release while the surrounding prose claims it is current.
    `tests/test_docs_version_pins.py` fails the build if you forget, because
    this drifted at the very first release.
-3. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
+5. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
    describing what's in the release.
-4. Commit those changes.
-5. Tag the commit `vX.Y.Z` and push the tag:
+6. Commit those changes.
+7. Tag the commit `vX.Y.Z` and push the tag:
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z"
    git push origin vX.Y.Z
    ```
-6. Cut a GitHub release from that tag, with release notes summarizing the
+8. Pushing the tag triggers `.github/workflows/publish.yml`, which builds,
+   publishes BOTH distributions to PyPI via Trusted Publishing (server
+   first — the adapter pins it exactly, so it must exist), then publishes the
+   registry entry. No token is involved in any step.
+
+   The two PyPI publishes run in separate jobs under **separate GitHub
+   environments**, `pypi` and `pypi-llm`, and that is required rather than
+   tidy. PyPI identifies a Trusted Publisher by exactly four fields —
+   repository owner, repository name, workflow filename, environment — so two
+   packages released from one repo and one workflow file collide on that tuple,
+   and registering the second one fails with *"a pending trusted publisher
+   matching this configuration has already been registered for a different
+   project name"*. Distinct environments make the tuples distinct. Each PyPI
+   project's trusted publisher must name the matching environment. `tests/test_docs_version_pins.py` and the workflow's own
+   first step both refuse a tag that disagrees with `__version__`.
+9. Cut a GitHub release from that tag, with release notes summarizing the
    CHANGELOG entry.
 
 **Tags are load-bearing, not bookkeeping.** The README's `uvx` install path

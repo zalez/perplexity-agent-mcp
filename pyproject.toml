@@ -19,7 +19,7 @@ name = "perplexity-agent-mcp"
 requires-python = ">=3.10"
 dependencies = []
 dynamic = ["version"]
-description = "Zero-dependency MCP server and llm plugin for Perplexity's Agent API."
+description = "Zero-dependency MCP server for Perplexity's Agent API."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Constantin Gonzalez", email = "constantin@glez.de" }]
@@ -40,24 +40,18 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/zalez/perplexity-agent-mcp"
 Issues = "https://github.com/zalez/perplexity-agent-mcp/issues"
-
-[project.optional-dependencies]
-# Only needed to use the `llm` CLI adapter. The MCP server itself has, and
-# will always have, zero runtime dependencies.
-llm = ["llm>=0.27"]
+Changelog = "https://github.com/zalez/perplexity-agent-mcp/blob/main/CHANGELOG.md"
+Security = "https://github.com/zalez/perplexity-agent-mcp/blob/main/SECURITY.md"
+"Release notes" = "https://github.com/zalez/perplexity-agent-mcp/releases"
 
 [project.scripts]
 perplexity-agent-mcp = "perplexity_agent_mcp:main"
 
-[project.entry-points.llm]
-# Registers the model with Simon Willison's `llm`. Inert unless llm is
-# installed, so this costs MCP-only users nothing.
-perplexity_agent = "perplexity_agent_llm"
-
 [tool.setuptools]
-# Two top-level modules, no package directory: the MCP server stays a single
-# file you can read end to end, and the llm adapter sits beside it.
-py-modules = ["perplexity_agent_mcp", "perplexity_agent_llm"]
+# One module, no package directory: the server stays a single file you can
+# read end to end. The `llm` adapter is a separate distribution built from
+# llm-plugin/ — see that directory's pyproject.toml.
+py-modules = ["perplexity_agent_mcp"]
 
 [tool.setuptools.dynamic]
 # Still one source of truth for the version: the module's own __version__.
@@ -76,6 +70,13 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "S", "RUF", "ANN"]
 # for retry jitter) are suppressed at their single call sites with noqa, so a
 # reviewer sees the justification next to the code rather than in this file.
 ignore = ["ANN401"]
+
+[tool.ruff.lint.isort]
+# Both modules are this project's own code. ruff infers first-party from the
+# project layout, and `perplexity_agent_llm` stopped being inferable when it
+# moved into llm-plugin/ to become its own distribution — so say it outright
+# rather than let import grouping depend on where a file happens to sit.
+known-first-party = ["perplexity_agent_mcp", "perplexity_agent_llm"]
 
 [tool.ruff.lint.per-file-ignores]
 # S101/ANN: asserts and loose annotations are fine in tests.
@@ -117,6 +118,10 @@ disallow_untyped_decorators = false
 module = ["llm", "llm.*", "pydantic", "pydantic.*"]
 ignore_missing_imports = true
 
+# Both of these read pyproject.toml with `tomllib`, which is stdlib from 3.11
+# and ships no type stubs. The imports are guarded by skipIf and only execute
+# on interpreters that have it; mypy checks against the 3.10 floor and cannot
+# see the guard.
 [[tool.mypy.overrides]]
-module = "tests.test_no_dependencies"
+module = ["tests.test_no_dependencies", "tests.test_docs_version_pins"]
 disable_error_code = ["import-not-found", "import-untyped"]

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.zalez/perplexity-agent-mcp",
+  "title": "Perplexity Agent",
+  "description": "Multi-step web research with citations through Perplexity's Agent API. Single file, Python standard library only, no MCP SDK.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/zalez/perplexity-agent-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/zalez/perplexity-agent-mcp",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "perplexity-agent-mcp",
+      "version": "0.2.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PERPLEXITY_API_KEY",
+          "description": "Your Perplexity API key. Read at call time and sent only as an Authorization header to api.perplexity.ai; never logged or echoed.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "PERPLEXITY_AGENT_WAIT_SECONDS",
+          "description": "How long a blocking call waits before handing back a response_id to collect later. Defaults to 55, just inside Claude Desktop's unconfigurable 60s tool-call timeout. Raise to 300 on clients without that limit.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+# A second distribution, built from the same repository as the MCP server.
+#
+# It is separate because `llm` users find plugins by name: `llm install
+# llm-<something>` is the idiom, and 52 of the 55 entries in llm's own plugin
+# directory follow it. Shipping this as an extra of `perplexity-agent-mcp`
+# would have meant nobody looking for an llm plugin could find it.
+#
+# It is NOT independently versioned. Both distributions are built and
+# published from the same tag at the same version, and the dependency below is
+# pinned exactly — so the adapter can never sit on a core it was not tested
+# against, and there is no version-skew surface to reason about.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-perplexity-agent"
+version = "0.2.0"
+description = "Perplexity's Agent API as a model for Simon Willison's llm CLI."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Constantin Gonzalez", email = "constantin@glez.de" }]
+keywords = ["llm", "perplexity", "research", "agent", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "llm>=0.27",
+    # Exact, not a range. This adapter is a thin translation layer over that
+    # package's internals; a range would let it run against a core whose
+    # shared helpers had moved. Both are released together, so this is never
+    # a burden. tests/test_docs_version_pins.py keeps it in step.
+    "perplexity-agent-mcp==0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zalez/perplexity-agent-mcp"
+Issues = "https://github.com/zalez/perplexity-agent-mcp/issues"
+Changelog = "https://github.com/zalez/perplexity-agent-mcp/blob/main/CHANGELOG.md"
+
+[project.entry-points.llm]
+perplexity_agent = "perplexity_agent_llm"
+
+[tool.setuptools]
+py-modules = ["perplexity_agent_llm"]

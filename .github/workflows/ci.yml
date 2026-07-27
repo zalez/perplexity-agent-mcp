@@ -107,7 +107,7 @@ jobs:
             pre-commit run --all-files --show-diff-on-failure
 
   llm-adapter:
-    name: llm adapter (optional extra)
+    name: llm adapter
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -116,12 +116,19 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: "3.14"
-      - name: Install the llm extra
+      - name: Install both distributions
         # tests/test_llm_plugin.py skips itself when `llm` is absent, which is
         # correct for MCP-only users but means the `test` matrix above never
         # actually runs those tests. Without this job they would skip in CI
         # forever and look green while proving nothing.
-        run: pip install -e '.[llm]' mypy==2.3.0
+        #
+        # Editable, and the server first: the adapter pins it exactly, so a
+        # non-editable install would fetch the released version from PyPI
+        # instead of testing the tree in front of us.
+        run: |
+          pip install -e .
+          pip install -e ./llm-plugin --no-deps
+          pip install 'llm>=0.27' mypy==2.3.0
       - name: Prove the adapter tests actually ran
         # A skipped test is not a passing test. Fail loudly if the extra did
         # not take, rather than reporting success on 17 skips.
@@ -129,17 +136,19 @@ jobs:
           python -m unittest tests.test_llm_plugin -v 2>&1 | tee /tmp/llm-tests.txt
           grep -qE '^OK$' /tmp/llm-tests.txt
           if grep -q 'skipped' /tmp/llm-tests.txt; then
-            echo "::error::adapter tests skipped - the llm extra did not install"
+            echo "::error::adapter tests skipped - llm or the adapter did not install"
             exit 1
           fi
       - name: Type-check the adapter against the real llm package
         # The whole-tree run cannot check this file meaningfully without llm
         # installed; this is where that check actually happens.
-        run: mypy --strict perplexity_agent_llm.py
+        run: mypy --strict llm-plugin/perplexity_agent_llm.py
       - name: Register the model in a real llm install
+        # The distribution llm reports is the ADAPTER's name, not the server's
+        # — they are two packages now.
         run: |
           llm plugins | tee /tmp/plugins.json
-          grep -q 'perplexity-agent-mcp' /tmp/plugins.json
+          grep -q 'llm-perplexity-agent' /tmp/plugins.json
           llm models | grep -q 'perplexity-agent'
 
   package:
