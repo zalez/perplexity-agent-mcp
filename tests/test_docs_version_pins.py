@@ -20,13 +20,16 @@ whose old entries are *supposed* to name old versions.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
+import sys
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
 SERVER = REPO_ROOT / "perplexity_agent_mcp.py"
+SERVER_JSON = REPO_ROOT / "server.json"
 
 # `@v1.2.3` in a git URL or prose. The placeholder form `@vX.Y.Z` deliberately
 # does not match — it names no release, so it cannot go stale.
@@ -73,6 +76,57 @@ class TestReadmeVersionPins(unittest.TestCase):
             2,
             "expected at least the MCP and llm install pins in README.md; "
             "if the snippets changed shape, update _PIN_RE to match",
+        )
+
+
+class TestServerJson(unittest.TestCase):
+    """`server.json` is what the MCP Registry publishes, and it repeats the
+    version twice — once for the server, once for the PyPI package it points
+    at. Both must match `__version__`, or a release publishes a registry entry
+    advertising a package version that does not exist.
+
+    The publish workflow checks this too, but failing here costs a test run
+    rather than half a release: PyPI does not allow re-uploading a version, so
+    a wrong number cannot simply be corrected in place.
+    """
+
+    def setUp(self) -> None:
+        self.manifest = json.loads(SERVER_JSON.read_text(encoding="utf-8"))
+        self.shipped = _shipped_version()
+
+    def test_server_version_matches_the_shipped_version(self) -> None:
+        self.assertEqual(self.manifest["version"], self.shipped)
+
+    def test_every_package_version_matches_too(self) -> None:
+        packages = self.manifest.get("packages") or []
+        self.assertTrue(packages, "server.json must declare at least one package")
+        for package in packages:
+            with self.subTest(package=package.get("identifier")):
+                self.assertEqual(package["version"], self.shipped)
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def test_the_package_identifier_matches_the_distribution_name(self) -> None:
+        """A typo here publishes a registry entry pointing at someone else's
+        package — or at nothing."""
+        import tomllib
+
+        name = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        distribution = name["project"]["name"]
+        for package in self.manifest["packages"]:
+            with self.subTest(package=package.get("identifier")):
+                self.assertEqual(package["identifier"], distribution)
+
+    def test_the_readme_carries_the_ownership_marker(self) -> None:
+        """The registry proves we own the PyPI package by finding
+        `mcp-name: <server name>` in the package README, which is what PyPI
+        renders as the project description. No marker, no publish — and the
+        failure happens at release time, not here, unless this test catches it.
+        """
+        expected = f"mcp-name: {self.manifest['name']}"
+        self.assertIn(
+            expected,
+            README.read_text(encoding="utf-8"),
+            f"README.md must contain {expected!r} for registry ownership verification",
         )
 
 

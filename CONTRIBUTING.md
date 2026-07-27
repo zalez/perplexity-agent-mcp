@@ -179,22 +179,31 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
    source of truth for the package version** — `pyproject.toml` declares
    `version` as `dynamic`, and setuptools reads it straight out of the module
    at build time. There is nowhere else to change it.
-2. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
+2. Update `version` in [server.json](server.json) — **twice**: the server's
+   own version and the PyPI package version it points at. The MCP Registry
+   publishes this file, so a stale number advertises a package version that
+   does not exist.
+3. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
    the CHANGELOG's link references at the foot of the file. The README tells
    people to pin a tag rather than track `main`, and that advice is only
    useful if the tag it shows is the current one — a stale pin quietly
    installs an older release while the surrounding prose claims it is current.
    `tests/test_docs_version_pins.py` fails the build if you forget, because
    this drifted at the very first release.
-3. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
+4. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
    describing what's in the release.
-4. Commit those changes.
-5. Tag the commit `vX.Y.Z` and push the tag:
+5. Commit those changes.
+6. Tag the commit `vX.Y.Z` and push the tag:
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z"
    git push origin vX.Y.Z
    ```
-6. Cut a GitHub release from that tag, with release notes summarizing the
+7. Pushing the tag triggers `.github/workflows/publish.yml`, which builds,
+   publishes to PyPI via Trusted Publishing, waits for the version to be
+   visible, then publishes the registry entry. No token is involved in
+   either step. `tests/test_docs_version_pins.py` and the workflow's own
+   first step both refuse a tag that disagrees with `__version__`.
+8. Cut a GitHub release from that tag, with release notes summarizing the
    CHANGELOG entry.
 
 **Tags are load-bearing, not bookkeeping.** The README's `uvx` install path

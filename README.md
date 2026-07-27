@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.zalez/perplexity-agent-mcp -->
+
 # perplexity-agent-mcp
 
 [![CI](https://github.com/zalez/perplexity-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/zalez/perplexity-agent-mcp/actions/workflows/ci.yml)

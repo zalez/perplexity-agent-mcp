@@ -1,0 +1,124 @@
+name: Publish
+
+# Two publishes, one trigger: the PyPI package, then the MCP Registry entry
+# that points at it. Order matters — the registry verifies that the package
+# exists and carries an `mcp-name:` marker matching server.json's name, so a
+# registry publish before the package lands would simply fail.
+#
+# Neither step uses a stored credential. PyPI uses Trusted Publishing and the
+# registry uses `login github-oidc`, so both mint a short-lived token from this
+# workflow's OIDC identity. There is no API token in this repository, and none
+# to leak, rotate, or forget.
+
+on:
+  push:
+    tags: ["v*"]
+  # Nothing here is safe to run casually, so there is deliberately no
+  # workflow_dispatch: a publish should follow a tag, which follows a review.
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two publishes of the same tag at once.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pypi:
+    name: publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/perplexity-agent-mcp
+    permissions:
+      contents: read
+      # Mints the OIDC token PyPI's Trusted Publishing exchanges for an
+      # upload token. This is the only reason the job needs anything beyond
+      # read access, and it cannot write to this repository.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          # Same clean-room reasoning as the packaging job in ci.yml: this
+          # builds the artifact people install, so nothing from a shared
+          # cache can reach it.
+          enable-cache: false
+
+      - name: Refuse to publish a tag that disagrees with the source
+        # A tag is just a label; __version__ is the thing that ends up in the
+        # filename on PyPI. If they disagree, the wrong version is published
+        # under the right name and cannot be taken back — PyPI does not allow
+        # re-uploading a version. Cheaper to fail here.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          src=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' perplexity_agent_mcp.py)
+          json=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
+          echo "tag=$tag  __version__=$src  server.json=$json"
+          test "$tag" = "$src"  || { echo "::error::tag $tag != __version__ $src"; exit 1; }
+          test "$tag" = "$json" || { echo "::error::tag $tag != server.json $json"; exit 1; }
+
+      - name: Build
+        run: uv build
+
+      - name: Check the artifacts the way PyPI will
+        run: uvx twine check --strict dist/*
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+
+  registry:
+    name: publish to the MCP Registry
+    runs-on: ubuntu-latest
+    # Only once the package it points at actually exists.
+    needs: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mcp-publisher
+        # Pinned rather than `latest`: this step runs with an OIDC identity
+        # able to publish under our namespace, so the binary it runs should
+        # not silently change between releases.
+        env:
+          MCP_PUBLISHER_VERSION: "1.8.0"
+        run: |
+          set -euo pipefail
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_${os}_${arch}.tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Wait for PyPI to serve the new version
+        # The registry validates that the package and version exist. PyPI's
+        # index is not instantly consistent after an upload, so poll rather
+        # than fail a release on a few seconds of propagation.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "https://pypi.org/pypi/perplexity-agent-mcp/${version}/json" >/dev/null; then
+              echo "perplexity-agent-mcp ${version} is live on PyPI"
+              exit 0
+            fi
+            echo "attempt ${attempt}: not visible yet, waiting"
+            sleep 10
+          done
+          echo "::error::perplexity-agent-mcp ${version} never appeared on PyPI"
+          exit 1
+
+      - name: Authenticate
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish

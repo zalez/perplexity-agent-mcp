@@ -40,6 +40,9 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/zalez/perplexity-agent-mcp"
 Issues = "https://github.com/zalez/perplexity-agent-mcp/issues"
+Changelog = "https://github.com/zalez/perplexity-agent-mcp/blob/main/CHANGELOG.md"
+Security = "https://github.com/zalez/perplexity-agent-mcp/blob/main/SECURITY.md"
+"Release notes" = "https://github.com/zalez/perplexity-agent-mcp/releases"
 
 [project.optional-dependencies]
 # Only needed to use the `llm` CLI adapter. The MCP server itself has, and
@@ -117,6 +120,10 @@ disallow_untyped_decorators = false
 module = ["llm", "llm.*", "pydantic", "pydantic.*"]
 ignore_missing_imports = true
 
+# Both of these read pyproject.toml with `tomllib`, which is stdlib from 3.11
+# and ships no type stubs. The imports are guarded by skipIf and only execute
+# on interpreters that have it; mypy checks against the 3.10 floor and cannot
+# see the guard.
 [[tool.mypy.overrides]]
-module = "tests.test_no_dependencies"
+module = ["tests.test_no_dependencies", "tests.test_docs_version_pins"]
 disable_error_code = ["import-not-found", "import-untyped"]
