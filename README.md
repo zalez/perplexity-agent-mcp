@@ -6,6 +6,8 @@ A single-file, zero-third-party-dependency [MCP](https://modelcontextprotocol.io
 
 Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,478 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
 
+> **Background reading:** [*perplexity-agent-mcp: an open-source MCP server for Perplexity's Agent API*](https://constantin.glez.de/posts/2026-07-27-perplexity-agent-mcp-open-source-mcp-server-perplexitys-agent-api/) — why this exists, what the Agent API does that Sonar doesn't, and what building it turned up.
+
 ## Why this exists
 
 Perplexity's own [`@perplexity-ai/mcp-server`](https://github.com/ppl-ai/modelcontextprotocol) wraps the Sonar chat models and the Search API. It does not reach the **Agent API** (`POST /v1/agent`) — Perplexity's multi-step, tool-using research endpoint, which runs its own web searches, fetches pages, and synthesizes one cited answer. This server fills exactly that gap. It's meant to run alongside the official one, not replace it.
@@ -263,6 +265,16 @@ pre-commit run --all-files
 ```
 
 18 hooks: file hygiene, `ruff` + `mypy --strict`, `gitleaks` and `zizmor` for secret and GitHub Actions security scanning, `codespell`, and the full test suite. CI runs the same hook set (see [`ci.yml`](.github/workflows/ci.yml)) plus a matrix across Python 3.10–3.14 and a packaging job that builds a wheel, installs it into a clean environment, and drives the console script over real pipes — a successful build alone doesn't prove the entry point works.
+
+## More
+
+- [Design spec](docs/specs/2026-07-22-perplexity-agent-mcp-design.md) — every
+  decision with its rationale, the places the original brief turned out to be
+  wrong, and the live verification results.
+- [Blog post](https://constantin.glez.de/posts/2026-07-27-perplexity-agent-mcp-open-source-mcp-server-perplexitys-agent-api/)
+  — the story behind the project.
+- [SECURITY.md](SECURITY.md) — threat model, and an honest account of what the
+  prompt-injection mitigation does and does not do.
 
 ## License
 
