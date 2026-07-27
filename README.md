@@ -89,7 +89,7 @@ One JSON snippet, nothing to download by hand. `uv` fetches and runs the package
     "perplexity-agent": {
       "command": "/absolute/path/to/uvx",
       "args": [
-        "--from", "git+https://github.com/zalez/perplexity-agent-mcp@v0.1.0",
+        "--from", "git+https://github.com/zalez/perplexity-agent-mcp@v0.2.0",
         "perplexity-agent-mcp"
       ],
       "env": { "PERPLEXITY_API_KEY": "pplx-…" }
@@ -100,7 +100,7 @@ One JSON snippet, nothing to download by hand. `uv` fetches and runs the package
 
 Two things worth getting right, each the difference between a working config and a support thread:
 
-> **Pin to a tag.** `@v0.1.0` above is a released version — the one this repository ships as of this README — not a branch. Check [Releases](https://github.com/zalez/perplexity-agent-mcp/releases) for the current tag. Leave off the `@…` entirely (`git+https://github.com/zalez/perplexity-agent-mcp`) and `uv` re-resolves to whatever is on `main` **every time your MCP client restarts** — including anything an attacker pushed there after compromising the repo. If you deliberately want that (e.g. you're a contributor testing unreleased changes), it's a conscious opt-in, not something to reach for by default.
+> **Pin to a tag.** `@v0.2.0` above is a released version — the one this repository ships as of this README — not a branch. Check [Releases](https://github.com/zalez/perplexity-agent-mcp/releases) for the current tag. Leave off the `@…` entirely (`git+https://github.com/zalez/perplexity-agent-mcp`) and `uv` re-resolves to whatever is on `main` **every time your MCP client restarts** — including anything an attacker pushed there after compromising the repo. If you deliberately want that (e.g. you're a contributor testing unreleased changes), it's a conscious opt-in, not something to reach for by default.
 
 > **Use an absolute path to `uvx`.** macOS GUI apps — Claude Desktop launched from Finder or Spotlight, not a terminal — do not inherit your shell's `PATH`. If the config above says `"command": "uvx"`, Claude Desktop very likely can't find it and fails with `spawn uvx ENOENT`. Run `which uvx` in your terminal and paste the absolute path it prints into `command` instead.
 

@@ -176,18 +176,25 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
 ## Release process
 
 1. Bump `__version__` in `perplexity_agent_mcp.py`. This is the **single
-   source of truth** — `pyproject.toml` declares `version` as `dynamic`, and
-   setuptools reads it straight out of the module at build time. There is
-   nowhere else to change it.
-2. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
+   source of truth for the package version** — `pyproject.toml` declares
+   `version` as `dynamic`, and setuptools reads it straight out of the module
+   at build time. There is nowhere else to change it.
+2. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
+   the CHANGELOG's link references at the foot of the file. The README tells
+   people to pin a tag rather than track `main`, and that advice is only
+   useful if the tag it shows is the current one — a stale pin quietly
+   installs an older release while the surrounding prose claims it is current.
+   `tests/test_docs_version_pins.py` fails the build if you forget, because
+   this drifted at the very first release.
+3. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
    describing what's in the release.
-3. Commit those two changes.
-4. Tag the commit `vX.Y.Z` and push the tag:
+4. Commit those changes.
+5. Tag the commit `vX.Y.Z` and push the tag:
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z"
    git push origin vX.Y.Z
    ```
-5. Cut a GitHub release from that tag, with release notes summarizing the
+6. Cut a GitHub release from that tag, with release notes summarizing the
    CHANGELOG entry.
 
 **Tags are load-bearing, not bookkeeping.** The README's `uvx` install path

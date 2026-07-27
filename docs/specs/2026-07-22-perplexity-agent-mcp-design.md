@@ -594,14 +594,17 @@ nothing is generated, bundled, or vendored. Reading the file audits both paths.
 `python3` at it. Trust chain: Python stdlib + Perplexity.
 
 **Path B — `uvx` (maximum convenience).** One JSON snippet, nothing downloaded by
-hand. Trust chain additionally includes `uv`, `flit_core`, and GitHub.
+hand. Trust chain additionally includes `uv`, the build backend, and GitHub.
+(Written when that backend was `flit_core`; it became `setuptools` in
+v0.2.0 — see D8. A placeholder tag is used deliberately below: this is a
+dated design document, not somewhere to copy an install command from.)
 
 ```json
 {
   "mcpServers": {
     "perplexity-agent": {
       "command": "/absolute/path/to/uvx",
-      "args": ["--from", "git+https://github.com/zalez/perplexity-agent-mcp@v0.1.0",
+      "args": ["--from", "git+https://github.com/zalez/perplexity-agent-mcp@vX.Y.Z",
                "perplexity-agent-mcp"],
       "env": { "PERPLEXITY_API_KEY": "pplx-…" }
     }
