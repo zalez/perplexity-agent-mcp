@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.3.0] - 2026-07-27
+
+### Added
+
+- **Both packages are now on PyPI**, so installing no longer means naming a git
+  URL:
+  - `uvx perplexity-agent-mcp` — the MCP server
+  - `llm install llm-perplexity-agent` — the `llm` CLI plugin
+- **Listed in the [MCP Registry](https://registry.modelcontextprotocol.io)** as
+  `io.github.zalez/perplexity-agent-mcp`. The community server list at
+  `modelcontextprotocol/servers` has been retired in favour of it, and the
+  registry only accepts packages from a trusted index — which is what made
+  publishing a prerequisite rather than a preference.
+- A tag-triggered publish workflow. It builds once, verifies, then publishes
+  the server, the adapter, and the registry entry in that order, because each
+  depends on the one before. No API token is stored anywhere: PyPI uses
+  Trusted Publishing and the registry uses OIDC, so both mint short-lived
+  credentials from the workflow's own identity.
+
+### Changed
+
+- **The `llm` adapter is its own distribution**, `llm-perplexity-agent`, built
+  from `llm-plugin/`. It was previously an `[llm]` extra of this package —
+  which meant nobody searching for an `llm` plugin could find it, since
+  `llm install llm-<name>` is the convention 52 of the 55 entries in llm's
+  own plugin directory follow. Both are released together from one tag at one
+  version, and the adapter pins the server exactly, so there is no version
+  skew to reason about.
+- The server declares **no optional dependencies at all** again, so installing
+  it pulls in nothing under any combination of extras.
+
+### Note
+
+`perplexity-agent-mcp` and `llm-perplexity-agent` publish from separate GitHub
+environments (`pypi` and `pypi-llm`). PyPI identifies a Trusted Publisher by
+repository owner, repository name, workflow filename and environment — two
+packages sharing all four collide, and the second registration is refused.
+
 ## [0.2.0] - 2026-07-24
 
 ### Added
@@ -83,6 +121,7 @@ Initial release.
 - 158 tests, stdlib `unittest` only, requiring no install step for
   contributors either.
 
-[Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zalez/perplexity-agent-mcp/releases/tag/v0.1.0

@@ -83,19 +83,16 @@ Use absolute paths for both — the same reason Path B insists on one below appl
 
 Trust chain: Python standard library, plus Perplexity. Nothing else.
 
-## Install — Path B: `uvx`
+## Install — Path B: `uvx` from PyPI
 
-One JSON snippet, nothing to download by hand. `uv` fetches and runs the package straight from GitHub each time your MCP client starts the server.
+One JSON snippet, nothing to download by hand. `uv` fetches and runs the published package each time your MCP client starts the server.
 
 ```json
 {
   "mcpServers": {
     "perplexity-agent": {
       "command": "/absolute/path/to/uvx",
-      "args": [
-        "--from", "git+https://github.com/zalez/perplexity-agent-mcp@v0.2.0",
-        "perplexity-agent-mcp"
-      ],
+      "args": ["perplexity-agent-mcp"],
       "env": { "PERPLEXITY_API_KEY": "pplx-…" }
     }
   }
@@ -104,9 +101,9 @@ One JSON snippet, nothing to download by hand. `uv` fetches and runs the package
 
 Two things worth getting right, each the difference between a working config and a support thread:
 
-> **Pin to a tag.** `@v0.2.0` above is a released version — the one this repository ships as of this README — not a branch. Check [Releases](https://github.com/zalez/perplexity-agent-mcp/releases) for the current tag. Leave off the `@…` entirely (`git+https://github.com/zalez/perplexity-agent-mcp`) and `uv` re-resolves to whatever is on `main` **every time your MCP client restarts** — including anything an attacker pushed there after compromising the repo. If you deliberately want that (e.g. you're a contributor testing unreleased changes), it's a conscious opt-in, not something to reach for by default.
-
 > **Use an absolute path to `uvx`.** macOS GUI apps — Claude Desktop launched from Finder or Spotlight, not a terminal — do not inherit your shell's `PATH`. If the config above says `"command": "uvx"`, Claude Desktop very likely can't find it and fails with `spawn uvx ENOENT`. Run `which uvx` in your terminal and paste the absolute path it prints into `command` instead.
+
+> **Pin the version if you want reproducibility.** `"args": ["perplexity-agent-mcp@0.3.0"]` holds you on one release. Unpinned, `uv` resolves the newest *published release* on every restart — which is a materially different risk from tracking a branch: releases are immutable, tagged, and go through the same CI as everything else. Pin if you would rather review each upgrade; leave it off if you would rather get fixes automatically. Either is defensible, which is why this is not a warning.
 
 ## Also: a plugin for `llm`
 
@@ -119,12 +116,6 @@ llm install llm-perplexity-agent
 llm keys set perplexity        # skip if you already set this for llm-perplexity
 llm -m perplexity-agent 'What changed in MCP 2026-07-28?'
 ```
-
-> **Not on PyPI yet.** `llm-perplexity-agent` is built from this repository's
-> [`llm-plugin/`](llm-plugin/) directory and publishes with the next release.
-> Until then, the MCP server above is the working install path. This section
-> is written for the version it will be, rather than a temporary command that
-> contradicts the pinning advice above.
 
 Options mirror the MCP tool:
 
