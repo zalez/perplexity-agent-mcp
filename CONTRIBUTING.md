@@ -206,7 +206,17 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
 8. Pushing the tag triggers `.github/workflows/publish.yml`, which builds,
    publishes BOTH distributions to PyPI via Trusted Publishing (server
    first — the adapter pins it exactly, so it must exist), then publishes the
-   registry entry. No token is involved in any step. `tests/test_docs_version_pins.py` and the workflow's own
+   registry entry. No token is involved in any step.
+
+   The two PyPI publishes run in separate jobs under **separate GitHub
+   environments**, `pypi` and `pypi-llm`, and that is required rather than
+   tidy. PyPI identifies a Trusted Publisher by exactly four fields —
+   repository owner, repository name, workflow filename, environment — so two
+   packages released from one repo and one workflow file collide on that tuple,
+   and registering the second one fails with *"a pending trusted publisher
+   matching this configuration has already been registered for a different
+   project name"*. Distinct environments make the tuples distinct. Each PyPI
+   project's trusted publisher must name the matching environment. `tests/test_docs_version_pins.py` and the workflow's own
    first step both refuse a tag that disagrees with `__version__`.
 9. Cut a GitHub release from that tag, with release notes summarizing the
    CHANGELOG entry.
