@@ -19,7 +19,7 @@ name = "perplexity-agent-mcp"
 requires-python = ">=3.10"
 dependencies = []
 dynamic = ["version"]
-description = "Zero-dependency MCP server and llm plugin for Perplexity's Agent API."
+description = "Zero-dependency MCP server for Perplexity's Agent API."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Constantin Gonzalez", email = "constantin@glez.de" }]
@@ -44,23 +44,14 @@ Changelog = "https://github.com/zalez/perplexity-agent-mcp/blob/main/CHANGELOG.m
 Security = "https://github.com/zalez/perplexity-agent-mcp/blob/main/SECURITY.md"
 "Release notes" = "https://github.com/zalez/perplexity-agent-mcp/releases"
 
-[project.optional-dependencies]
-# Only needed to use the `llm` CLI adapter. The MCP server itself has, and
-# will always have, zero runtime dependencies.
-llm = ["llm>=0.27"]
-
 [project.scripts]
 perplexity-agent-mcp = "perplexity_agent_mcp:main"
 
-[project.entry-points.llm]
-# Registers the model with Simon Willison's `llm`. Inert unless llm is
-# installed, so this costs MCP-only users nothing.
-perplexity_agent = "perplexity_agent_llm"
-
 [tool.setuptools]
-# Two top-level modules, no package directory: the MCP server stays a single
-# file you can read end to end, and the llm adapter sits beside it.
-py-modules = ["perplexity_agent_mcp", "perplexity_agent_llm"]
+# One module, no package directory: the server stays a single file you can
+# read end to end. The `llm` adapter is a separate distribution built from
+# llm-plugin/ — see that directory's pyproject.toml.
+py-modules = ["perplexity_agent_mcp"]
 
 [tool.setuptools.dynamic]
 # Still one source of truth for the version: the module's own __version__.

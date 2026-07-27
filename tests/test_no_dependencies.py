@@ -85,28 +85,36 @@ class TestNoDependencies(unittest.TestCase):
         self.assertEqual(data["project"]["dependencies"], [])
 
     @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
-    def test_the_only_optional_dependency_is_the_llm_adapter(self) -> None:
-        """This used to assert `optional-dependencies` was absent entirely.
+    def test_the_server_declares_no_optional_dependencies_either(self) -> None:
+        """Not even an extra.
 
-        The `llm` adapter needs `llm`, so the key now exists — but relaxing
-        the check to "extras are fine" would retire a supply-chain gate
-        rather than adjust it. It instead pins the exact allowed set, so
-        adding any further extra is a deliberate act that shows up here.
-
-        Installing an extra is opt-in and never happens to an MCP user: the
-        server imports nothing from `perplexity_agent_llm`, and the entry
-        point that references it is inert without `llm` installed.
+        This briefly allowed one — an `llm` extra, when the CLI adapter shipped
+        inside this distribution. Splitting the adapter into its own package
+        (`llm-perplexity-agent`, built from llm-plugin/) removed the need, so
+        the stricter original invariant is back: installing the server pulls in
+        nothing at all, under any combination of extras.
         """
         import tomllib
 
         data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        extras = data["project"].get("optional-dependencies", {})
-        self.assertEqual(sorted(extras), ["llm"], "the only extra may be `llm`")
-        self.assertEqual(
-            [_requirement_name(r) for r in extras["llm"]],
-            ["llm"],
-            "the `llm` extra may depend on `llm` and nothing else",
-        )
+        self.assertNotIn("optional-dependencies", data["project"])
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def test_the_llm_adapter_depends_on_llm_and_this_server_and_nothing_else(self) -> None:
+        """The adapter is allowed dependencies; it is not allowed surprises.
+
+        Two, exactly: `llm` (the thing it plugs into) and this server (the
+        client it adapts). Anything else appearing here would mean the
+        zero-dependency story quietly stopped being true for the half of the
+        project people reach by `llm install`.
+        """
+        import tomllib
+
+        plugin = REPO_ROOT / "llm-plugin" / "pyproject.toml"
+        data = tomllib.loads(plugin.read_text(encoding="utf-8"))
+        names = sorted(_requirement_name(r) for r in data["project"]["dependencies"])
+        self.assertEqual(names, ["llm", "perplexity-agent-mcp"])
+        self.assertNotIn("optional-dependencies", data["project"])
 
     @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
     def test_build_backend_stays_a_single_zero_dependency_package(self) -> None:

@@ -30,6 +30,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
 SERVER = REPO_ROOT / "perplexity_agent_mcp.py"
 SERVER_JSON = REPO_ROOT / "server.json"
+PLUGIN_PYPROJECT = REPO_ROOT / "llm-plugin" / "pyproject.toml"
 
 # `@v1.2.3` in a git URL or prose. The placeholder form `@vX.Y.Z` deliberately
 # does not match — it names no release, so it cannot go stale.
@@ -127,6 +128,39 @@ class TestServerJson(unittest.TestCase):
             expected,
             README.read_text(encoding="utf-8"),
             f"README.md must contain {expected!r} for registry ownership verification",
+        )
+
+
+class TestPluginVersionLockstep(unittest.TestCase):
+    """`llm-perplexity-agent` is a second distribution, deliberately NOT
+    independently versioned.
+
+    Both are built and published from the same tag, and the adapter pins the
+    server exactly, so the adapter can never run against a core it was not
+    tested against. That only holds while three numbers agree: the server's
+    `__version__`, the adapter's own version, and the version it pins. Nothing
+    but this test makes them agree.
+    """
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def setUp(self) -> None:
+        import tomllib
+
+        self.plugin = tomllib.loads(PLUGIN_PYPROJECT.read_text(encoding="utf-8"))["project"]
+        self.shipped = _shipped_version()
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def test_the_adapter_ships_the_same_version_as_the_server(self) -> None:
+        self.assertEqual(self.plugin["version"], self.shipped)
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib requires 3.11")
+    def test_the_adapter_pins_this_exact_server_version(self) -> None:
+        pins = [d for d in self.plugin["dependencies"] if d.startswith("perplexity-agent-mcp")]
+        self.assertEqual(len(pins), 1, "expected exactly one pin on the server")
+        self.assertEqual(
+            pins[0],
+            f"perplexity-agent-mcp=={self.shipped}",
+            "the adapter must pin the server exactly, at the version being shipped",
         )
 
 

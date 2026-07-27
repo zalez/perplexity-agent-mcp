@@ -1,9 +1,15 @@
 name: Publish
 
-# Two publishes, one trigger: the PyPI package, then the MCP Registry entry
-# that points at it. Order matters — the registry verifies that the package
-# exists and carries an `mcp-name:` marker matching server.json's name, so a
-# registry publish before the package lands would simply fail.
+# Three publishes, one trigger, in a required order:
+#
+#   1. perplexity-agent-mcp   — the MCP server
+#   2. llm-perplexity-agent   — the `llm` adapter, which depends on (1) at an
+#                               exact version, so (1) must exist first
+#   3. the MCP Registry entry — which validates that (1) exists and carries an
+#                               `mcp-name:` marker matching server.json
+#
+# Both distributions are built from the same tag at the same version. That is
+# what lets the adapter pin the server exactly instead of guessing a range.
 #
 # Neither step uses a stored credential. PyPI uses Trusted Publishing and the
 # registry uses `login github-oidc`, so both mint a short-lived token from this
@@ -58,18 +64,46 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           src=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' perplexity_agent_mcp.py)
           json=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
-          echo "tag=$tag  __version__=$src  server.json=$json"
+          plug=$(python3 -c "import tomllib;print(tomllib.load(open('llm-plugin/pyproject.toml','rb'))['project']['version'])")
+          pin=$(python3 -c "import tomllib;d=tomllib.load(open('llm-plugin/pyproject.toml','rb'));print([x for x in d['project']['dependencies'] if x.startswith('perplexity-agent-mcp')][0])")
+          echo "tag=$tag  __version__=$src  server.json=$json  plugin=$plug  pin=$pin"
           test "$tag" = "$src"  || { echo "::error::tag $tag != __version__ $src"; exit 1; }
           test "$tag" = "$json" || { echo "::error::tag $tag != server.json $json"; exit 1; }
+          test "$tag" = "$plug" || { echo "::error::tag $tag != llm-plugin version $plug"; exit 1; }
+          test "$pin" = "perplexity-agent-mcp==$tag" || { echo "::error::adapter pins $pin, not ==$tag"; exit 1; }
 
-      - name: Build
-        run: uv build
+      - name: Build both distributions
+        run: |
+          uv build
+          uv build --directory llm-plugin
 
       - name: Check the artifacts the way PyPI will
-        run: uvx twine check --strict dist/*
+        run: uvx twine check --strict dist/* llm-plugin/dist/*
 
-      - name: Publish
+      - name: Publish the server
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+
+      - name: Wait for the server to be installable
+        # The adapter pins it exactly, so publishing the adapter before PyPI
+        # serves the server would upload a package that cannot be resolved.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "https://pypi.org/pypi/perplexity-agent-mcp/${version}/json" >/dev/null; then
+              echo "perplexity-agent-mcp ${version} is live"
+              exit 0
+            fi
+            echo "attempt ${attempt}: not visible yet, waiting"
+            sleep 10
+          done
+          echo "::error::perplexity-agent-mcp ${version} never appeared on PyPI"
+          exit 1
+
+      - name: Publish the llm adapter
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+        with:
+          packages-dir: llm-plugin/dist
 
   registry:
     name: publish to the MCP Registry
@@ -99,23 +133,8 @@ jobs:
             | tar xz mcp-publisher
           ./mcp-publisher --version
 
-      - name: Wait for PyPI to serve the new version
-        # The registry validates that the package and version exist. PyPI's
-        # index is not instantly consistent after an upload, so poll rather
-        # than fail a release on a few seconds of propagation.
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          for attempt in $(seq 1 30); do
-            if curl -fsS "https://pypi.org/pypi/perplexity-agent-mcp/${version}/json" >/dev/null; then
-              echo "perplexity-agent-mcp ${version} is live on PyPI"
-              exit 0
-            fi
-            echo "attempt ${attempt}: not visible yet, waiting"
-            sleep 10
-          done
-          echo "::error::perplexity-agent-mcp ${version} never appeared on PyPI"
-          exit 1
+      # No PyPI wait here: the job above already blocked on the server being
+      # served before it published the adapter, so it is live by now.
 
       - name: Authenticate
         run: ./mcp-publisher login github-oidc

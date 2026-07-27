@@ -183,27 +183,32 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
    own version and the PyPI package version it points at. The MCP Registry
    publishes this file, so a stale number advertises a package version that
    does not exist.
-3. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
+3. Update [llm-plugin/pyproject.toml](llm-plugin/pyproject.toml) — also
+   **twice**: its own `version`, and the exact `perplexity-agent-mcp==X.Y.Z`
+   pin. The adapter is a second distribution released from the same tag at the
+   same version; the exact pin is what stops it running against a core it was
+   never tested against.
+4. Update the `@vX.Y.Z` pins in the [README](README.md) install snippets, and
    the CHANGELOG's link references at the foot of the file. The README tells
    people to pin a tag rather than track `main`, and that advice is only
    useful if the tag it shows is the current one — a stale pin quietly
    installs an older release while the surrounding prose claims it is current.
    `tests/test_docs_version_pins.py` fails the build if you forget, because
    this drifted at the very first release.
-4. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
+5. Add an entry to [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format)
    describing what's in the release.
-5. Commit those changes.
-6. Tag the commit `vX.Y.Z` and push the tag:
+6. Commit those changes.
+7. Tag the commit `vX.Y.Z` and push the tag:
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z"
    git push origin vX.Y.Z
    ```
-7. Pushing the tag triggers `.github/workflows/publish.yml`, which builds,
-   publishes to PyPI via Trusted Publishing, waits for the version to be
-   visible, then publishes the registry entry. No token is involved in
-   either step. `tests/test_docs_version_pins.py` and the workflow's own
+8. Pushing the tag triggers `.github/workflows/publish.yml`, which builds,
+   publishes BOTH distributions to PyPI via Trusted Publishing (server
+   first — the adapter pins it exactly, so it must exist), then publishes the
+   registry entry. No token is involved in any step. `tests/test_docs_version_pins.py` and the workflow's own
    first step both refuse a tag that disagrees with `__version__`.
-8. Cut a GitHub release from that tag, with release notes summarizing the
+9. Cut a GitHub release from that tag, with release notes summarizing the
    CHANGELOG entry.
 
 **Tags are load-bearing, not bookkeeping.** The README's `uvx` install path
