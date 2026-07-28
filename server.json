@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.zalez/perplexity-agent-mcp",
   "title": "Perplexity Agent",
-  "description": "Multi-step web research with citations through Perplexity's Agent API. Single file, Python standard library only, no MCP SDK.",
-  "version": "0.3.0",
+  "description": "Multi-step web research with citations via Perplexity's Agent API. Standard library only.",
+  "version": "0.3.1",
   "repository": {
     "url": "https://github.com/zalez/perplexity-agent-mcp",
     "source": "github"
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "perplexity-agent-mcp",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
