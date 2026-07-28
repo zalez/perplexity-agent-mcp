@@ -25,6 +25,7 @@ import pathlib
 import re
 import sys
 import unittest
+from typing import ClassVar
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
@@ -166,6 +167,59 @@ class TestPluginVersionLockstep(unittest.TestCase):
             f"perplexity-agent-mcp=={self.shipped}",
             "the adapter must pin the server exactly, at the version being shipped",
         )
+
+
+class TestServerJsonRegistryConstraints(unittest.TestCase):
+    """The MCP Registry rejects a manifest that breaks its schema — and it
+    does so at the very end of a release, after both PyPI packages are already
+    published and unrepublishable.
+
+    That is exactly what happened on v0.3.0: `description` was 130 characters
+    against a documented limit of 100, both packages went out fine, and the
+    registry publish failed on the last step. The constraints below are cheap
+    to check locally and cost a whole version number to discover remotely.
+
+    Values are from the published schema, mirrored here rather than fetched so
+    the suite stays offline:
+    https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json
+    If the registry starts rejecting a manifest this test passes, re-read that
+    schema — it moved, and this copy is stale.
+    """
+
+    # field -> (min, max)
+    LENGTHS: ClassVar[dict[str, tuple[int, int]]] = {
+        "name": (3, 200),
+        "description": (1, 100),
+        "title": (1, 100),
+        "version": (1, 255),
+    }
+    NAME_RE = re.compile(r"^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$")
+
+    def setUp(self) -> None:
+        self.manifest = json.loads(SERVER_JSON.read_text(encoding="utf-8"))
+
+    def test_required_fields_are_present(self) -> None:
+        for field in ("name", "description", "version"):
+            with self.subTest(field=field):
+                self.assertIn(field, self.manifest)
+
+    def test_string_lengths_are_within_the_schema_limits(self) -> None:
+        for field, (low, high) in self.LENGTHS.items():
+            value = self.manifest.get(field)
+            if value is None:  # only name/description/version are required
+                continue
+            with self.subTest(field=field, length=len(value)):
+                self.assertGreaterEqual(len(value), low)
+                self.assertLessEqual(
+                    len(value),
+                    high,
+                    f"server.json {field!r} is {len(value)} characters; the registry "
+                    f"rejects anything over {high} — and it does so only at publish "
+                    f"time, after PyPI has already accepted the release.",
+                )
+
+    def test_the_name_matches_the_registry_pattern(self) -> None:
+        self.assertRegex(self.manifest["name"], self.NAME_RE)
 
 
 if __name__ == "__main__":

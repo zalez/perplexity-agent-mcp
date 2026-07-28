@@ -103,7 +103,7 @@ Two things worth getting right, each the difference between a working config and
 
 > **Use an absolute path to `uvx`.** macOS GUI apps — Claude Desktop launched from Finder or Spotlight, not a terminal — do not inherit your shell's `PATH`. If the config above says `"command": "uvx"`, Claude Desktop very likely can't find it and fails with `spawn uvx ENOENT`. Run `which uvx` in your terminal and paste the absolute path it prints into `command` instead.
 
-> **Pin the version if you want reproducibility.** `"args": ["perplexity-agent-mcp@0.3.0"]` holds you on one release. Unpinned, `uv` resolves the newest *published release* on every restart — which is a materially different risk from tracking a branch: releases are immutable, tagged, and go through the same CI as everything else. Pin if you would rather review each upgrade; leave it off if you would rather get fixes automatically. Either is defensible, which is why this is not a warning.
+> **Pin the version if you want reproducibility.** `"args": ["perplexity-agent-mcp@0.3.1"]` holds you on one release. Unpinned, `uv` resolves the newest *published release* on every restart — which is a materially different risk from tracking a branch: releases are immutable, tagged, and go through the same CI as everything else. Pin if you would rather review each upgrade; leave it off if you would rather get fixes automatically. Either is defensible, which is why this is not a warning.
 
 ## Also: a plugin for `llm`
 

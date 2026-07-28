@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-perplexity-agent"
-version = "0.3.0"
+version = "0.3.1"
 description = "Perplexity's Agent API as a model for Simon Willison's llm CLI."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -41,7 +41,7 @@ dependencies = [
     # package's internals; a range would let it run against a core whose
     # shared helpers had moved. Both are released together, so this is never
     # a burden. tests/test_docs_version_pins.py keeps it in step.
-    "perplexity-agent-mcp==0.3.0",
+    "perplexity-agent-mcp==0.3.1",
 ]
 
 [project.urls]

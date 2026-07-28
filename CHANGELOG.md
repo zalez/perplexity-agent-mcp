@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.3.1] - 2026-07-28
+
+### Fixed
+
+- Shortened `server.json`'s `description` to fit the MCP Registry's 100-character
+  limit. v0.3.0 published to PyPI successfully but its registry entry was
+  rejected on the last step of the release — the description was 130 characters,
+  and nothing checked that before the packages were already out and
+  unrepublishable.
+- `tests/test_docs_version_pins.py` now validates `server.json` against every
+  documented registry constraint (required fields, all four length limits, the
+  name pattern), so the next one fails in CI instead of at the end of a release.
+
 ## [0.3.0] - 2026-07-27
 
 ### Added
@@ -121,7 +134,8 @@ Initial release.
 - 158 tests, stdlib `unittest` only, requiring no install step for
   contributors either.
 
-[Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zalez/perplexity-agent-mcp/releases/tag/v0.1.0
