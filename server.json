@@ -3,7 +3,7 @@
   "name": "io.github.zalez/perplexity-agent-mcp",
   "title": "Perplexity Agent",
   "description": "Multi-step web research with citations through Perplexity's Agent API. Single file, Python standard library only, no MCP SDK.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "repository": {
     "url": "https://github.com/zalez/perplexity-agent-mcp",
     "source": "github"
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "perplexity-agent-mcp",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

@@ -78,7 +78,7 @@ def _claim_stdout() -> None:
     sys.stdout = sys.stderr
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # =============================================================================
 # BAND 1 — CONFIG.  Constants only, no logic.

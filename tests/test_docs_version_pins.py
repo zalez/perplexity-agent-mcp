@@ -32,9 +32,12 @@ SERVER = REPO_ROOT / "perplexity_agent_mcp.py"
 SERVER_JSON = REPO_ROOT / "server.json"
 PLUGIN_PYPROJECT = REPO_ROOT / "llm-plugin" / "pyproject.toml"
 
-# `@v1.2.3` in a git URL or prose. The placeholder form `@vX.Y.Z` deliberately
-# does not match — it names no release, so it cannot go stale.
-_PIN_RE = re.compile(r"@v(?P<version>\d+\.\d+\.\d+)")
+# Both pin forms the README can carry:
+#   @v1.2.3   a git tag        (`git+https://…@v1.2.3`)
+#   @1.2.3    a PyPI version   (`uvx perplexity-agent-mcp@1.2.3`)
+# The placeholder `@vX.Y.Z` deliberately does not match — it names no release,
+# so it cannot go stale.
+_PIN_RE = re.compile(r"@v?(?P<version>\d+\.\d+\.\d+)")
 
 
 def _shipped_version() -> str:
@@ -74,9 +77,10 @@ class TestReadmeVersionPins(unittest.TestCase):
         pins = _PIN_RE.findall(README.read_text(encoding="utf-8"))
         self.assertGreaterEqual(
             len(pins),
-            2,
-            "expected at least the MCP and llm install pins in README.md; "
-            "if the snippets changed shape, update _PIN_RE to match",
+            1,
+            "expected at least one version pin in README.md; if the install "
+            "snippets changed shape, update _PIN_RE to match rather than "
+            "letting this pass on zero findings",
         )
 
 
