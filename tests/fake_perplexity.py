@@ -72,10 +72,10 @@ class FakePerplexity:
                 self.end_headers()
                 self.wfile.write(encoded)
 
-            def do_GET(self) -> None:  # BaseHTTPRequestHandler API
+            def do_GET(self) -> None:
                 self._handle("GET")
 
-            def do_POST(self) -> None:  # BaseHTTPRequestHandler API
+            def do_POST(self) -> None:
                 self._handle("POST")
 
             def log_message(self, *args: Any) -> None:

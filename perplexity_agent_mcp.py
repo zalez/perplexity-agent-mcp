@@ -90,10 +90,19 @@ __version__ = "0.3.1"
 # in-process instead (see tests/test_perplexity_client.py).
 API_BASE = "https://api.perplexity.ai"
 
-# MCP revision we implement. See docs/specs — 2026-07-28 is a breaking change we
-# deliberately do not yet implement.
+# MCP revisions we implement. The server is dual-era: legacy clients still use
+# `initialize`, while modern clients can probe with `server/discover` and carry
+# their protocol version in `_meta` on each request. Keep the ordered tuple:
+# `server/discover` advertises it as-is, newest first.
+MODERN_PROTOCOL_VERSION = "2026-07-28"
 PROTOCOL_VERSION = "2025-11-25"
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-11-25", "2025-06-18", "2025-03-26"})
+SUPPORTED_LEGACY_PROTOCOL_VERSIONS = frozenset({"2025-11-25", "2025-06-18", "2025-03-26"})
+SUPPORTED_PROTOCOL_VERSIONS = (
+    MODERN_PROTOCOL_VERSION,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+)
 
 SERVER_NAME = "perplexity-agent"
 SERVER_TITLE = "Perplexity Agent"
@@ -776,6 +785,12 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+_META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+_CACHE_STATIC_MS = 24 * 60 * 60 * 1000
 
 # A generous cap on a single incoming request line, enforced by serve()
 # below. BAND 2's _MAX_RESPONSE_BYTES bounds a different trust boundary — a
@@ -797,34 +812,51 @@ def _response(request_id: object, result: dict[str, object]) -> dict[str, object
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _error(request_id: object, code: int, message: str) -> dict[str, object]:
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+def _error(
+    request_id: object, code: int, message: str, data: object | None = None
+) -> dict[str, object]:
+    error: dict[str, object] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _server_info() -> dict[str, object]:
+    return {"name": SERVER_NAME, "title": SERVER_TITLE, "version": __version__}
+
+
+def _capabilities() -> dict[str, object]:
+    # The PRESENCE of the tools key is the declaration. listChanged is omitted
+    # because our tool list is static and we will never send the corresponding
+    # notification.
+    return {"tools": {}}
 
 
 def handle_initialize(params: dict[str, object]) -> dict[str, object]:
     """Negotiate a protocol version.
 
-    The spec is explicit that a server MUST answer with a version it supports —
-    NOT an error — when it cannot honour the client's request. Erroring here
-    breaks clients that would otherwise have happily downgraded.
+    This is the legacy handshake path. It deliberately negotiates only legacy
+    versions even though the server also supports the modern stateless revision:
+    a legacy client has no per-request `_meta`, so replying with 2026-07-28 here
+    would select semantics that client cannot actually speak.
     """
     requested = params.get("protocolVersion")
     version = (
         requested
-        if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS
+        if isinstance(requested, str) and requested in SUPPORTED_LEGACY_PROTOCOL_VERSIONS
         else PROTOCOL_VERSION
     )
     return {
         "protocolVersion": version,
-        # The PRESENCE of the tools key is the declaration. listChanged is
-        # omitted because our tool list is static and we will never send the
-        # corresponding notification.
-        "capabilities": {"tools": {}},
-        "serverInfo": {
-            "name": SERVER_NAME,
-            "title": SERVER_TITLE,
-            "version": __version__,
-        },
+        "capabilities": _capabilities(),
+        "serverInfo": _server_info(),
+    }
+
+
+def handle_discover(params: dict[str, object]) -> dict[str, object]:
+    return {
+        "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
+        "capabilities": _capabilities(),
     }
 
 
@@ -1263,7 +1295,7 @@ def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
     if not isinstance(meta, dict):
         return None
     token = meta.get("progressToken")
-    if not isinstance(token, (str, int)) or isinstance(token, bool):
+    if not isinstance(token, str | int) or isinstance(token, bool):
         return None
 
     def notify(message: str, progress: float) -> None:
@@ -1297,10 +1329,54 @@ def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
 
 HANDLERS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "initialize": handle_initialize,
+    "server/discover": handle_discover,
     "ping": handle_ping,
     "tools/list": handle_tools_list,
     "tools/call": handle_tools_call,
 }
+
+
+def _modern_version(params: dict[str, object]) -> str | None:
+    """Return the requested modern protocol version, or None for legacy calls.
+
+    For interoperability, `server/discover` is allowed to work without `_meta`:
+    real dual-era clients SHOULD send it, but early implementations in the wild
+    sometimes probe with `{}`. Once a request does declare a modern version, the
+    required modern client capabilities key must be present.
+    """
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+
+    version = meta.get(_META_PROTOCOL_VERSION)
+    if version is None:
+        return None
+    if not isinstance(version, str):
+        raise _ProtocolError(INVALID_PARAMS, f"`{_META_PROTOCOL_VERSION}` must be a string.")
+
+    client_capabilities = meta.get(_META_CLIENT_CAPABILITIES)
+    if not isinstance(client_capabilities, dict):
+        raise _ProtocolError(INVALID_PARAMS, f"`{_META_CLIENT_CAPABILITIES}` must be an object.")
+
+    return version
+
+
+def _modern_result(method: str, result: dict[str, object]) -> dict[str, object]:
+    """Add result fields required by the 2026-07-28 stateless protocol."""
+    modern = dict(result)
+    modern["resultType"] = "complete"
+
+    meta = modern.get("_meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault(_META_SERVER_INFO, _server_info())
+    modern["_meta"] = meta
+
+    if method in {"server/discover", "tools/list"}:
+        modern["ttlMs"] = _CACHE_STATIC_MS
+        modern["cacheScope"] = "public"
+
+    return modern
 
 
 def dispatch(message: dict[str, object]) -> dict[str, object] | None:
@@ -1329,7 +1405,22 @@ def dispatch(message: dict[str, object]) -> dict[str, object] | None:
         params = {}
 
     try:
-        return _response(request_id, handler(params))
+        modern_version = _modern_version(params)
+        if modern_version is not None and modern_version not in SUPPORTED_PROTOCOL_VERSIONS:
+            return _error(
+                request_id,
+                UNSUPPORTED_PROTOCOL_VERSION,
+                f"Unsupported protocol version: {modern_version}",
+                {
+                    "requested": modern_version,
+                    "supported": list(SUPPORTED_PROTOCOL_VERSIONS),
+                },
+            )
+
+        result = handler(params)
+        if modern_version is not None or method == "server/discover":
+            result = _modern_result(method, result)
+        return _response(request_id, result)
     except _ProtocolError as exc:
         return _error(request_id, exc.code, exc.message)
     except Exception as exc:  # broad and intentional: the read loop must never die

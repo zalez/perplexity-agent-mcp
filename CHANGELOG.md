@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Added dual-era MCP protocol support for stdio clients: modern clients can
+  probe with `server/discover` and send `2026-07-28` requests with per-request
+  `_meta`, while legacy clients continue to use the `initialize` handshake.
 
 ## [0.3.1] - 2026-07-28
 

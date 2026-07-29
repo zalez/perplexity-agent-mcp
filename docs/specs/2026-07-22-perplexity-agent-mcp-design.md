@@ -44,8 +44,8 @@ findings and they drive the design.
 
 | Fact | Value |
 |---|---|
-| Current stable revision | **`2025-11-25`** |
-| Next revision | `2026-07-28` (dated five days after this design was written) — removes `initialize` entirely, adds `server/discover`, protocol becomes stateless |
+| Current stable revision at design time | **`2025-11-25`** |
+| Final 2026 revision | `2026-07-28` — removes `initialize` for modern clients, adds `server/discover`, protocol becomes stateless |
 | stdio framing | Newline-delimited JSON, UTF-8. **Unchanged** in the new revision. No `Content-Length` framing (that's LSP, not MCP). |
 | JSON-RPC batching | **Removed** in `2025-06-18`. A line parsing to an array is invalid. |
 | Validation errors | **`isError: true`, NOT `-32602`** — flipped in `2025-11-25` (SEP-1303) so models can self-correct. |
@@ -146,7 +146,7 @@ Each decision records its rationale so it is not silently reversed later.
 | # | Decision | Rationale |
 |---|---|---|
 | D1 | **Single file + PEP 723**, plus an opt-in `pyproject.toml` for `uvx` | The audit boundary stays exactly one file. Packaging is a delivery mechanism that ships *the same bytes*, not extra code. |
-| D2 | **Target MCP `2025-11-25`**, flat dispatch dict | Every shipping client speaks it today. `2026-07-28` lands five days after this was written, but clients need their own dual-era support first, and stdio framing is unchanged — so `server/discover` is a later additive change, not a rewrite. |
+| D2 | **Dual-era MCP support**, flat dispatch dict | Legacy clients keep the `2025-11-25` initialize path. Modern stdio clients use `server/discover` and stateless per-request `_meta`. stdio framing is unchanged, so this remains an additive protocol layer change rather than a rewrite. |
 | D3 | **Python floor 3.10**, develop and gate on 3.14 | The client config invokes bare `python3`; stock macOS `python3` is 3.9.6. Nothing here needs modern syntax. 3.9 is EOL and documenting an EOL floor on a security repo looks bad. Matrix proves the floor is real. |
 | D4 | **stdlib `unittest`, fake upstream via `http.server`** | `git clone && python3 -m unittest` with nothing installed. The zero-supply-chain claim then holds for contributors too, not just users. |
 | D5 | **Background + poll** upstream, always | One code path for every preset. Each HTTP call is short, so a network blip cannot kill a long run. The deep presets are the entire reason this project exists. |
@@ -700,7 +700,8 @@ failure mode it prevents: a future agent helpfully adding `requests`, or
 
 ## 16. Follow-ons (explicitly out of scope for v0.1.0)
 
-- `server/discover` + stateless `_meta` handling for MCP `2026-07-28`.
+- `server/discover` + stateless `_meta` handling for MCP `2026-07-28` was a
+  v0.1.0 follow-on and is now implemented as a dual-era stdio path.
 - **MCP Tasks extension** (`2025-11-25`, experimental): the spec-blessed async
   pattern — a task-augmented `tools/call` returns `CreateTaskResult` with
   `taskId` / `ttl` / `pollInterval`, and the client polls `tasks/get`. VS Code

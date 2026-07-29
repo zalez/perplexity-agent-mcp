@@ -65,7 +65,7 @@ def _get_json(url: str) -> dict[str, object] | list[object] | None:
             parsed = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return None
-    if isinstance(parsed, (dict, list)):
+    if isinstance(parsed, dict | list):
         return parsed
     return None
 

@@ -52,9 +52,10 @@ Constraints:
   `sys.stdout` at stderr. It is deliberately NOT an import-time side effect:
   the `llm` adapter imports this module, and hijacking stdout on import
   would redirect that whole program's output. Don't move it back.
-- **MCP protocol revision `2025-11-25`.** Accept `2025-11-25`, `2025-06-18`,
-  `2025-03-26`; echo on match, else return `2025-11-25`. Never error on
-  version negotiation.
+- **Dual-era MCP protocol support.** Legacy clients still negotiate through
+  `initialize`: accept `2025-11-25`, `2025-06-18`, `2025-03-26`; echo on
+  match, else return `2025-11-25`. Modern clients probe with
+  `server/discover` and send `2026-07-28` in per-request `_meta`.
 - **Validation errors are `isError: true`, never JSON-RPC `-32602`**
   (SEP-1303 — see [§3](#3-error-handling) below).
 - **Line length 100.** Ruff-formatted. `mypy --strict` clean. Every public
@@ -76,7 +77,7 @@ simpler that turned out to be wrong.
 | # | Decision | Why |
 |---|---|---|
 | D1 | Single file + PEP 723, plus an opt-in `pyproject.toml` | The audit boundary stays exactly one file. Packaging ships the same bytes, not extra code. |
-| D2 | Target MCP `2025-11-25`, flat dispatch dict | Every shipping client speaks it today. stdio framing is unchanged in the next revision, so upgrading later is additive, not a rewrite. |
+| D2 | Dual-era MCP support, flat dispatch dict | Legacy clients keep the `2025-11-25` initialize path. Modern stdio clients use `server/discover` and stateless per-request `_meta`. stdio framing is unchanged, so this stays additive instead of becoming a rewrite. |
 | D3 | Python floor 3.10, develop/gate on 3.14 | Client configs invoke bare `python3`; stock macOS `python3` is 3.9.6. Nothing here needs newer syntax, and documenting an EOL floor on a security repo looks bad. |
 | D4 | stdlib `unittest`, fake upstream via `http.server` | `git clone && python3 -m unittest` with nothing installed. The zero-supply-chain claim holds for contributors too, not just users. |
 | D5 | Background + poll upstream, always | One code path for every preset. Each HTTP call is short, so a network blip can't kill a long-running job. |

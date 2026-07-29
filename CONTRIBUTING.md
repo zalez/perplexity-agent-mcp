@@ -93,11 +93,11 @@ parenthetical after each one.
   library's — lands harmlessly on stderr instead of corrupting the protocol
   stream. Don't remove that rebind, and don't add a legitimate reason to
   write to the real stdout outside of `_write()`.
-- **MCP protocol revision `2025-11-25`.** Accept `2025-11-25`, `2025-06-18`,
-  and `2025-03-26`; echo the client's version back on a match, otherwise
-  return `2025-11-25`. **Never error on version negotiation** — the spec is
-  explicit that a server must answer with a version it supports, not an
-  error.
+- **Dual-era MCP protocol support.** Legacy clients still negotiate through
+  `initialize`: accept `2025-11-25`, `2025-06-18`, and `2025-03-26`; echo the
+  client's version back on a match, otherwise return `2025-11-25`. Modern
+  clients probe with `server/discover` and send `2026-07-28` in per-request
+  `_meta`.
 - **Validation errors are `isError: true`, never JSON-RPC `-32602`.** Since
   MCP `2025-11-25` (SEP-1303), a bad tool argument is something the calling
   model should be able to read and self-correct from, not a protocol-level

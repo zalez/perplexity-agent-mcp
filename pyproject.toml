@@ -88,6 +88,7 @@ known-first-party = ["perplexity_agent_mcp", "perplexity_agent_llm"]
 # deliberately, to catch stdout/framing bugs in-process tests would miss),
 # not a one-off worth a noqa at each of its several call sites.
 "tests/*" = ["S101", "ANN", "S603"]
+"tests/fake_perplexity.py" = ["N802"]
 
 [tool.mypy]
 python_version = "3.10"

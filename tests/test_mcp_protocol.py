@@ -33,6 +33,14 @@ INIT = {
     },
 }
 
+MODERN_META = {
+    "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1.0"},
+    }
+}
+
 
 def run_server(
     *messages: dict[str, Any], env: dict[str, str] | None = None
@@ -91,6 +99,79 @@ class TestLifecycle(unittest.TestCase):
         bare = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
         (reply,) = run_server(bare)
         self.assertEqual(reply["result"]["protocolVersion"], "2025-11-25")
+
+    def test_initialize_does_not_negotiate_the_modern_revision(self) -> None:
+        """Modern 2026 clients use per-request `_meta`, not `initialize`."""
+        modern = json.loads(json.dumps(INIT))
+        modern["params"]["protocolVersion"] = "2026-07-28"
+        (reply,) = run_server(modern)
+        self.assertEqual(reply["result"]["protocolVersion"], "2025-11-25")
+
+    def test_server_discover_advertises_dual_era_support(self) -> None:
+        (reply,) = run_server(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": MODERN_META,
+            }
+        )
+        result = reply["result"]
+        self.assertEqual(
+            result["supportedVersions"],
+            ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
+        )
+        self.assertEqual(result["capabilities"], {"tools": {}})
+        self.assertEqual(result["resultType"], "complete")
+        self.assertEqual(result["cacheScope"], "public")
+        self.assertGreater(result["ttlMs"], 0)
+        self.assertEqual(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "perplexity-agent"
+        )
+
+    def test_server_discover_is_available_before_initialize(self) -> None:
+        """Dual-era stdio clients probe with server/discover before initialize."""
+        (reply,) = run_server({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        self.assertNotIn("error", reply)
+        self.assertIn("2026-07-28", reply["result"]["supportedVersions"])
+
+    def test_modern_tools_list_gets_result_type_and_cache_hints(self) -> None:
+        (reply,) = run_server(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": MODERN_META,
+            }
+        )
+        result = reply["result"]
+        self.assertEqual(result["resultType"], "complete")
+        self.assertEqual(result["cacheScope"], "public")
+        self.assertGreater(result["ttlMs"], 0)
+        self.assertEqual(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "perplexity-agent"
+        )
+        self.assertEqual(
+            [tool["name"] for tool in result["tools"]],
+            ["perplexity_agent", "perplexity_agent_result", "perplexity_agent_cancel"],
+        )
+
+    def test_unsupported_modern_version_returns_typed_mcp_error(self) -> None:
+        params = json.loads(json.dumps(MODERN_META))
+        params["_meta"]["io.modelcontextprotocol/protocolVersion"] = "2099-01-01"
+        (reply,) = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params})
+        self.assertEqual(reply["error"]["code"], -32022)
+        self.assertEqual(reply["error"]["data"]["requested"], "2099-01-01")
+        self.assertEqual(
+            reply["error"]["data"]["supported"],
+            ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
+        )
+
+    def test_modern_request_requires_client_capabilities_meta(self) -> None:
+        params = {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
+        (reply,) = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params})
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("clientCapabilities", reply["error"]["message"])
 
     def test_ping_returns_an_empty_result(self) -> None:
         replies = run_server(INIT, {"jsonrpc": "2.0", "id": "abc", "method": "ping"})
