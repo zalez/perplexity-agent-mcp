@@ -93,11 +93,20 @@ parenthetical after each one.
   library's — lands harmlessly on stderr instead of corrupting the protocol
   stream. Don't remove that rebind, and don't add a legitimate reason to
   write to the real stdout outside of `_write()`.
-- **MCP protocol revision `2025-11-25`.** Accept `2025-11-25`, `2025-06-18`,
-  and `2025-03-26`; echo the client's version back on a match, otherwise
-  return `2025-11-25`. **Never error on version negotiation** — the spec is
-  explicit that a server must answer with a version it supports, not an
-  error.
+- **Two MCP protocol revisions, served side by side.** `2026-07-28` (modern:
+  stateless, no handshake) and `2025-11-25` (legacy: `initialize`), plus
+  `2025-06-18` and `2025-03-26` for legacy negotiation. Which era a request
+  gets is decided **per request, from what the request contains** — never from
+  a flag, a setting, or anything remembered from an earlier request. The three
+  precedence rules are stated in full above `HANDLERS`; read them before
+  touching `dispatch()`.
+- **Never error on version negotiation — in `initialize`.** The spec is
+  explicit that a server must answer that method with a version it supports
+  rather than an error, so a legacy client can downgrade. The modern era has
+  the **opposite** rule: a request declaring a revision we do not speak MUST
+  get `-32022` with the list to retry from. These two are not in conflict and
+  must not be unified — they govern different methods. Both are pinned by
+  tests, deliberately from opposite sides.
 - **Validation errors are `isError: true`, never JSON-RPC `-32602`.** Since
   MCP `2025-11-25` (SEP-1303), a bad tool argument is something the calling
   model should be able to read and self-correct from, not a protocol-level
@@ -165,7 +174,10 @@ Two things CI checks that pre-commit never will, on this repo specifically:
 - **That the package actually builds and runs.** Pre-commit never invokes
   `uv build`. CI's `package` job does: builds a wheel, installs it into a
   clean virtualenv, and drives the real `perplexity-agent-mcp` console script
-  over pipes with a live `initialize` / `tools/list` exchange. A successful
+  over pipes — twice, once per protocol era: a legacy `initialize` /
+  `tools/list` exchange, then a modern `server/discover` / `tools/list` one.
+  Both, because a wheel that serves one era and not the other looks perfectly
+  healthy from whichever side you happened to test. A successful
   `pre-commit run` says nothing about whether `pyproject.toml`,
   `__version__`, or the entry point still work — if your change touches any
   of those, run `uv build` yourself and smoke-test the result.
