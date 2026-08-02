@@ -52,9 +52,21 @@ Constraints:
   `sys.stdout` at stderr. It is deliberately NOT an import-time side effect:
   the `llm` adapter imports this module, and hijacking stdout on import
   would redirect that whole program's output. Don't move it back.
-- **MCP protocol revision `2025-11-25`.** Accept `2025-11-25`, `2025-06-18`,
-  `2025-03-26`; echo on match, else return `2025-11-25`. Never error on
-  version negotiation.
+- **Two MCP protocol revisions, one process.** Modern `2026-07-28`
+  (stateless, no handshake) and legacy `2025-11-25` / `2025-06-18` /
+  `2025-03-26`. **Era is decided per request, structurally** — never by a
+  flag, a setting, or state carried from an earlier request. The three
+  precedence rules live above `HANDLERS` in the source; that comment is the
+  authority, not this line.
+- **Never error on version negotiation — in `initialize` only.** Echo the
+  requested legacy version on a match, else return `2025-11-25`. The modern
+  path has the opposite rule and MUST return `-32022` for a revision it does
+  not speak. **Do not unify these two.** They are pinned by tests from
+  opposite sides precisely because unifying them looks like a tidy-up.
+- **`2026-07-28` must never enter `SUPPORTED_PROTOCOL_VERSIONS`**, which is
+  the legacy-negotiable set. It is derived from the tail of
+  `ADVERTISED_PROTOCOL_VERSIONS` so this is impossible rather than merely
+  forbidden; keep the derivation.
 - **Validation errors are `isError: true`, never JSON-RPC `-32602`**
   (SEP-1303 — see [§3](#3-error-handling) below).
 - **Line length 100.** Ruff-formatted. `mypy --strict` clean. Every public
@@ -76,7 +88,7 @@ simpler that turned out to be wrong.
 | # | Decision | Why |
 |---|---|---|
 | D1 | Single file + PEP 723, plus an opt-in `pyproject.toml` | The audit boundary stays exactly one file. Packaging ships the same bytes, not extra code. |
-| D2 | Target MCP `2025-11-25`, flat dispatch dict | Every shipping client speaks it today. stdio framing is unchanged in the next revision, so upgrading later is additive, not a rewrite. |
+| D2 | Dual-era: MCP `2026-07-28` and `2025-11-25` from one flat dispatch dict | The bet in the original D2 paid off. stdio framing was unchanged across the revision, and the flat `HANDLERS` dict plus the deliberate absence of any session state meant adding the stateless era was additive — one more entry, plus era/shaping in `dispatch()`. `HANDLERS` values became records so a new method cannot be added without declaring its era. See D18. |
 | D3 | Python floor 3.10, develop/gate on 3.14 | Client configs invoke bare `python3`; stock macOS `python3` is 3.9.6. Nothing here needs newer syntax, and documenting an EOL floor on a security repo looks bad. |
 | D4 | stdlib `unittest`, fake upstream via `http.server` | `git clone && python3 -m unittest` with nothing installed. The zero-supply-chain claim holds for contributors too, not just users. |
 | D5 | Background + poll upstream, always | One code path for every preset. Each HTTP call is short, so a network blip can't kill a long-running job. |
@@ -92,6 +104,7 @@ simpler that turned out to be wrong.
 | D15 | Never claim cancellation saves money | Cancelled runs report no `usage` and no `cost` at all; the docs are silent on whether you're still billed. The tool says it stops the run and nothing more. |
 | D16 | An `llm` adapter, same repo, **separate distribution** | `llm` has no MCP support (simonw/llm#696, open since Jan 2025) and `llm-perplexity` wraps only Sonar. Bands 1-3 are already a reusable Perplexity client, so the adapter is a thin second adapter rather than a fork. It ships as its own package, `llm-perplexity-agent` from `llm-plugin/`, because llm users find plugins by name — 52 of the 55 entries in llm's directory are `llm-*`, and an extra of a package called `…-mcp` is undiscoverable. Same repo, one tag, one version, exact pin: the adapter can never run against a core it was not tested against. |
 | D17 | Spotlighting OFF by default in the `llm` adapter | In MCP the answer goes into a model that is holding tools, so injection can cause actions. In `llm -m perplexity-agent` it goes to a terminal for a human, and llm runs no tool loop by default — the realistic risk is a manipulated summary if piped, not a hijacked agent. `-o spotlight true` turns it on. |
+| D18 | Era detection is structural and per-request, with exactly two method-level exemptions | `initialize` is ALWAYS legacy (a modern-`_meta` `initialize` would otherwise get `resultType` bolted on — a frame belonging to neither revision) and `server/discover` is ALWAYS modern, answered even with no `_meta` at all. That second one is not politeness: on stdio `server/discover` is the backward-compatibility probe, and any error reply tells a dual-era client "legacy server", which per the spec it then caches for the life of the process. A strict-looking era check there would silently cost the entire modern era. Everything else keys on `_meta.io.modelcontextprotocol/protocolVersion`. |
 
 ## 3. Error handling
 
@@ -107,6 +120,9 @@ happens *inside* a tool that was found and dispatched correctly.
 |---|---|
 | Unknown method | `-32601` |
 | Unknown tool name, malformed `params` shape (`arguments` not an object) | `-32602` |
+| **Modern request declaring a revision we don't speak** | **`-32022`**, `data: {supported, requested}`. The client picks from `supported` and retries; without that payload it has nothing to retry with. Applies ONLY to the modern `_meta` path — `initialize` still never errors. |
+| **Modern request missing `_meta.io.modelcontextprotocol/clientCapabilities`** | **`-32602`**, `data: {missing: [...]}`. Spec-strict: a required field is missing, so the request is malformed. Checked in `dispatch()` **before** the handler runs — inside `handle_tools_call` it would land after the unknown-tool check and come back as "Unknown tool" instead. |
+| Modern request omitting `protocolVersion` entirely | **Served as legacy.** Not an error: to a stateless server it is byte-identical to a legacy request, so there is nothing left to recognise it by. An honest limit of structural detection, pinned by a test so it stays a decision. |
 | **Bad argument value** (empty query, bad `recency`, malformed `response_id`) | **`isError: true`** |
 | Missing / empty `PERPLEXITY_API_KEY` | `isError: true` |
 | Perplexity 401 / 429 / 400, timeout, network failure | `isError: true` |
@@ -197,7 +213,7 @@ are correct and this doc is stale.
 python3 -m unittest discover -v
 
 # `lint` job
-pip install ruff==0.15.22 mypy==2.3.0
+pip install ruff==0.16.0 mypy==2.3.0
 ruff check .
 ruff format --check .
 mypy --strict perplexity_agent_mcp.py
@@ -211,13 +227,22 @@ SKIP=ruff-check,ruff-format,mypy,unittest pre-commit run --all-files --show-diff
 pre-commit run --all-files
 
 # `package` job — build the wheel, install into a clean venv, drive the real
-# console script over pipes
+# console script over pipes, once per protocol era
 uv build
 uv venv /tmp/smoke
 uv pip install --python /tmp/smoke/bin/python dist/*.whl
+
+# legacy leg
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | /tmp/smoke/bin/perplexity-agent-mcp
+
+# modern leg — server/discover deliberately carries no _meta, because that is
+# the backward-compatibility probe a dual-era client actually sends
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' \
   | /tmp/smoke/bin/perplexity-agent-mcp
 ```
 

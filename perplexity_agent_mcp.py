@@ -47,7 +47,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from typing import TextIO
+from typing import NamedTuple, TextIO
 
 # --- stdout discipline -------------------------------------------------------
 # The single most common way to break a hand-written MCP server is a stray
@@ -78,7 +78,7 @@ def _claim_stdout() -> None:
     sys.stdout = sys.stderr
 
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 # =============================================================================
 # BAND 1 — CONFIG.  Constants only, no logic.
@@ -90,10 +90,40 @@ __version__ = "0.3.1"
 # in-process instead (see tests/test_perplexity_client.py).
 API_BASE = "https://api.perplexity.ai"
 
-# MCP revision we implement. See docs/specs — 2026-07-28 is a breaking change we
-# deliberately do not yet implement.
+# MCP revisions we implement. There are two eras, served side by side from one
+# process, and a request is assigned to one of them by what the request itself
+# contains — never by a flag, a config setting, or anything remembered from an
+# earlier request:
+#
+#   LEGACY (2025-11-25 and earlier)  An `initialize` handshake negotiates once.
+#   MODERN (2026-07-28)              No handshake at all. Every request carries
+#                                    its own protocol version and client
+#                                    capabilities in `_meta`, and
+#                                    `server/discover` advertises what we speak.
+#
+# See _era_of() and the three precedence rules stated above HANDLERS.
 PROTOCOL_VERSION = "2025-11-25"
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-11-25", "2025-06-18", "2025-03-26"})
+MODERN_PROTOCOL_VERSION = "2026-07-28"
+
+# Everything this server answers to, newest first. An ORDERED TUPLE, not a set,
+# and that is load-bearing: `server/discover` and the -32022 error both hand
+# this list to a client that reads it in preference order. Building it from a
+# frozenset would reorder it with PYTHONHASHSEED — output that differs between
+# processes, which is the kind of CI flake that never reproduces locally.
+ADVERTISED_PROTOCOL_VERSIONS = (
+    MODERN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+    "2025-06-18",
+    "2025-03-26",
+)
+
+# The versions a LEGACY `initialize` may negotiate — derived from the tail of
+# the tuple above, so the modern revision can never leak into it. That is not
+# fussiness: handle_initialize() echoes back any member of this set, so a
+# 2026-07-28 entry here would have the server answer `initialize` — a method
+# the modern revision does not have — by claiming to speak the modern
+# revision. Deriving it makes that impossible instead of forbidden.
+SUPPORTED_PROTOCOL_VERSIONS = frozenset(ADVERTISED_PROTOCOL_VERSIONS[1:])
 
 SERVER_NAME = "perplexity-agent"
 SERVER_TITLE = "Perplexity Agent"
@@ -768,7 +798,9 @@ def _cancel(response_id: str, deadline: float | None = None) -> str:
 #
 # Every method this server understands is one entry in HANDLERS. If you want to
 # know what this program can be asked to do, read that dict — it is the whole
-# surface.
+# surface. Each entry also records which protocol era the method belongs to and
+# whether its result is cacheable, so those questions cannot be answered in some
+# other part of the file that later drifts out of step with the dict.
 # =============================================================================
 
 PARSE_ERROR = -32700
@@ -776,6 +808,43 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+
+# MCP's own code, from the block the spec reserves for itself. The spec
+# partitions JSON-RPC's implementation-defined range: -32000..-32019 is
+# grandfathered usage that new code must not allocate in, and -32020..-32099
+# belongs to the specification. We may emit codes from that second block only
+# when the spec defines them, and only with the meaning it gives them — so
+# this is the one entry, not the start of a local collection.
+UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+# The `_meta` keys the modern revision reserves. The `io.modelcontextprotocol/`
+# prefix belongs to the specification, so these names are fixed and nothing
+# else may invent keys beneath it.
+#
+# Note what is NOT here: `progressToken` is spelled bare, with no prefix, in
+# both eras. It shares this same `_meta` dict, which is why nothing in this
+# file may filter `_meta` down to "just the keys we know" — see _read_meta().
+_META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+
+# Cache hints attached to modern results that declare themselves cacheable.
+#
+# "private", not "public", because the tool list is a function of THIS
+# process's environment: _WAIT_SECONDS_SCHEMA_MAX is read from
+# PERPLEXITY_AGENT_WAIT_SECONDS at import and surfaces both as a schema
+# `maximum` and inside human-readable description text. A shared cache handing
+# that answer to a differently-configured consumer would be handing over a
+# ceiling that is simply wrong for it.
+#
+# Five minutes rather than the hours a static list would justify, because
+# `ttlMs` is the ONLY invalidation channel this server has: it deliberately
+# does not declare `listChanged` and will never send that notification (see
+# handle_initialize). Raise the env var, restart, and a client holding a long
+# cache would keep advertising the old ceiling to its model until the TTL
+# lapsed. Five minutes bounds how long that lie can survive.
+_CACHE_TTL_MS = 5 * 60 * 1000
+_CACHE_SCOPE = "private"
 
 # A generous cap on a single incoming request line, enforced by serve()
 # below. BAND 2's _MAX_RESPONSE_BYTES bounds a different trust boundary — a
@@ -797,16 +866,49 @@ def _response(request_id: object, result: dict[str, object]) -> dict[str, object
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _error(request_id: object, code: int, message: str) -> dict[str, object]:
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+def _error(request_id: object, code: int, message: str, data: object = None) -> dict[str, object]:
+    """A JSON-RPC error frame, with the spec's optional `data` member.
+
+    `data` is omitted entirely when absent rather than sent as null, so the
+    frames this server emitted before the member existed are unchanged.
+    """
+    error: dict[str, object] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _server_info() -> dict[str, object]:
+    """Who we are, in the one shape both eras use.
+
+    Built in one place because there are three call sites — the legacy
+    `initialize` result, the `DiscoverResult`, and the `_meta` of every modern
+    result — and three hand-written copies would drift at the next version
+    bump. The spec is explicit that this is self-reported and unverified:
+    clients display it, and must not make decisions on it.
+    """
+    return {"name": SERVER_NAME, "title": SERVER_TITLE, "version": __version__}
+
+
+# The capabilities this server offers, in the shape both eras want. The
+# PRESENCE of the tools key is the declaration. listChanged is omitted because
+# our tool list is static and we will never send the corresponding
+# notification — which is also why _CACHE_TTL_MS above has to be short.
+def _capabilities() -> dict[str, object]:
+    return {"tools": {}}
 
 
 def handle_initialize(params: dict[str, object]) -> dict[str, object]:
-    """Negotiate a protocol version.
+    """Negotiate a protocol version. LEGACY ERA ONLY — see HANDLERS.
 
     The spec is explicit that a server MUST answer with a version it supports —
     NOT an error — when it cannot honour the client's request. Erroring here
     breaks clients that would otherwise have happily downgraded.
+
+    That rule is scoped to this method and nowhere else. The modern era has no
+    handshake to be lenient about; it declares a version on every request and
+    the spec requires a hard -32022 when we do not speak it. The two rules
+    coexist because they govern two different code paths — do not unify them.
     """
     requested = params.get("protocolVersion")
     version = (
@@ -816,15 +918,35 @@ def handle_initialize(params: dict[str, object]) -> dict[str, object]:
     )
     return {
         "protocolVersion": version,
-        # The PRESENCE of the tools key is the declaration. listChanged is
-        # omitted because our tool list is static and we will never send the
-        # corresponding notification.
-        "capabilities": {"tools": {}},
-        "serverInfo": {
-            "name": SERVER_NAME,
-            "title": SERVER_TITLE,
-            "version": __version__,
-        },
+        "capabilities": _capabilities(),
+        "serverInfo": _server_info(),
+    }
+
+
+def handle_server_discover(params: dict[str, object]) -> dict[str, object]:
+    """Advertise what we speak. MODERN ERA ONLY — see HANDLERS.
+
+    Servers MUST implement this in the modern revision. It is also the
+    designated backward-compatibility probe on stdio: a dual-era client sends
+    it first, and reads the answer to decide which era we are. That is exactly
+    why it is answered unconditionally, even without the `_meta` a modern
+    request is supposed to carry — see rule 2 above HANDLERS for what going
+    the other way would cost.
+    """
+    return {
+        "supportedVersions": list(ADVERTISED_PROTOCOL_VERSIONS),
+        "capabilities": _capabilities(),
+        # Cross-tool knowledge that belongs in no single tool description,
+        # which is what the spec asks this field to carry. Deliberately short:
+        # it is prepended to a model's context on every session.
+        "instructions": (
+            "Research runs are asynchronous. perplexity_agent submits a query and, "
+            "if it finishes inside the wait budget, returns the answer directly; "
+            "otherwise it returns a response_id to collect later with "
+            "perplexity_agent_result, or to stop with perplexity_agent_cancel. "
+            "Answers carry their sources and are wrapped in a delimiter marking "
+            "them as untrusted web content."
+        ),
     }
 
 
@@ -1243,12 +1365,20 @@ def _tool_text(text: str, is_error: bool) -> dict[str, object]:
 
 
 class _ProtocolError(Exception):
-    """Raised inside a handler to produce a JSON-RPC error rather than a result."""
+    """Raised inside a handler to produce a JSON-RPC error rather than a result.
 
-    def __init__(self, code: int, message: str) -> None:
+    Carries `data` because the modern revision's errors are not just a code and
+    a sentence: -32022 has to tell the client which versions it could retry
+    with, or the client has nothing to act on. dispatch() forwards it — adding
+    the field here without forwarding it there would drop every payload
+    silently, which is worse than never having had one.
+    """
+
+    def __init__(self, code: int, message: str, data: object = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data
 
 
 def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
@@ -1258,6 +1388,15 @@ def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
     supplied. Claude Desktop never supplies one; VS Code does and shows it in the
     UI; Claude Code uses it to reset its idle timer. So this is pure upside where
     available and a no-op everywhere else — nothing depends on it.
+
+    Unchanged by the modern revision, which still spells the token bare as
+    `progressToken` with no prefix, in the same `_meta` dict that now also
+    carries the `io.modelcontextprotocol/*` protocol keys. The two coexist; see
+    _read_meta() for the rule that keeps them coexisting.
+
+    What is emitted below is a NOTIFICATION, not a Result — so it gets no
+    `resultType` and no `serverInfo`, in either era. _shape_modern() decorates
+    results only, and this deliberately never passes through it.
     """
     meta = params.get("_meta")
     if not isinstance(meta, dict):
@@ -1295,12 +1434,156 @@ def _progress_notifier(params: dict[str, object]) -> ProgressFn | None:
     return notify
 
 
-HANDLERS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
-    "initialize": handle_initialize,
-    "ping": handle_ping,
-    "tools/list": handle_tools_list,
-    "tools/call": handle_tools_call,
+# --- Protocol eras -----------------------------------------------------------
+#
+# THE THREE PRECEDENCE RULES. Every request is assigned to exactly one era, and
+# these are checked in order:
+#
+#   1. `initialize`      -> ALWAYS legacy, whatever `_meta` it carries.
+#      The modern revision has no handshake, so there is no such thing as a
+#      modern `initialize`. Classifying one as modern because it happened to
+#      carry modern `_meta` would bolt `resultType` and `serverInfo` onto an
+#      InitializeResult and hand back a frame belonging to neither revision.
+#
+#   2. `server/discover` -> ALWAYS modern, even with no `_meta` at all.
+#      This is the method's whole purpose: on stdio it is the designated
+#      backward-compatibility probe, and a dual-era client sends it first to
+#      find out what we are. Classify a bare probe as legacy and it falls
+#      through to "method not found" — which is the exact signal a client reads
+#      as "legacy server, never speak modern to it again". The probe would
+#      permanently defeat itself.
+#
+#   3. everything else   -> structural: modern if the request declares a
+#      protocol version in `_meta`, legacy otherwise.
+#
+# Rule 3 has an honest limit worth stating plainly rather than leaving for
+# someone to discover: a modern client that omits `protocolVersion` is, to a
+# stateless server, byte-for-byte indistinguishable from a legacy client, and
+# gets served as one. The spec's "reject a request missing required fields
+# with -32602" therefore cannot apply to that case — there is nothing left to
+# recognise it by. It applies to requests that DO declare a version and then
+# omit something else, which _validate_modern() enforces.
+
+_ERA_LEGACY = "legacy"
+_ERA_MODERN = "modern"
+_ERA_BOTH = "both"
+
+
+class _Method(NamedTuple):
+    """One entry in HANDLERS — everything dispatch() needs about a method.
+
+    Era and cacheability live here, next to the handler, rather than in
+    lookaside sets elsewhere in the file. That is the point: a method cannot be
+    added without answering both questions, and dispatch() contains no method
+    names at all, so the two can never drift apart.
+    """
+
+    handler: Callable[[dict[str, object]], dict[str, object]]
+    era: str
+    # Whether the result is a CacheableResult and so must carry ttlMs and
+    # cacheScope in the modern era. tools/call is deliberately NOT: its result
+    # extends Result, not CacheableResult, and a cached research answer would
+    # be a different answer.
+    cacheable: bool = False
+
+
+HANDLERS: dict[str, _Method] = {
+    "initialize": _Method(handle_initialize, _ERA_LEGACY),
+    "server/discover": _Method(handle_server_discover, _ERA_MODERN, cacheable=True),
+    # `ping` is removed in 2026-07-28, but nothing in the spec forbids
+    # answering it, and an empty result is unambiguous. Served in both eras on
+    # purpose: refusing it can only break a client using it as a liveness
+    # check, and gains nothing whatsoever.
+    "ping": _Method(handle_ping, _ERA_BOTH),
+    "tools/list": _Method(handle_tools_list, _ERA_BOTH, cacheable=True),
+    "tools/call": _Method(handle_tools_call, _ERA_BOTH),
 }
+
+
+def _read_meta(params: dict[str, object]) -> dict[str, object]:
+    """The request's `_meta`, or an empty dict if it has none.
+
+    READ-ONLY, and the returned object belongs to the caller's request. Nothing
+    in this file may filter, rebuild, or strip it: `progressToken` shares this
+    dict with the protocol keys, so handing handlers a "cleaned" `_meta` would
+    silently end progress notifications — no error, no log, just a client whose
+    idle timer stops being reset.
+    """
+    meta = params.get("_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _request_era(declared: str, params: dict[str, object]) -> str:
+    """Apply the three precedence rules above. Returns _ERA_LEGACY or _ERA_MODERN."""
+    if declared != _ERA_BOTH:
+        return declared  # rules 1 and 2: the method itself decides
+    return _ERA_MODERN if _META_PROTOCOL_VERSION in _read_meta(params) else _ERA_LEGACY
+
+
+def _validate_modern(params: dict[str, object]) -> None:
+    """Check the `_meta` fields the modern revision requires. Raises, or returns.
+
+    Runs only for modern requests, and only in dispatch() — strictly before any
+    handler sees the request. Placement matters: inside handle_tools_call this
+    would sit after the unknown-tool check and beside the argument validation,
+    so a malformed modern call would come back as "Unknown tool" or as
+    isError: true instead of as the protocol error it is.
+    """
+    meta = _read_meta(params)
+
+    if _META_PROTOCOL_VERSION not in meta:
+        # Only `server/discover` can reach here: every other modern request was
+        # classified modern BECAUSE this key is present (rule 3). A bare probe
+        # is the backward-compatibility handshake and is answered as it is.
+        return
+
+    requested = meta[_META_PROTOCOL_VERSION]
+    if not isinstance(requested, str) or requested not in ADVERTISED_PROTOCOL_VERSIONS:
+        raise _ProtocolError(
+            UNSUPPORTED_PROTOCOL_VERSION,
+            "Unsupported protocol version.",
+            # The client picks a mutually supported version from `supported`
+            # and retries. Without this payload it has nothing to retry WITH.
+            {"supported": list(ADVERTISED_PROTOCOL_VERSIONS), "requested": requested},
+        )
+
+    # A required-fields check, never a deny-unknown one: `_meta` is an
+    # extension point by design, and rejecting keys we do not recognise would
+    # reject `progressToken` along with everything the spec adds next.
+    if not isinstance(meta.get(_META_CLIENT_CAPABILITIES), dict):
+        raise _ProtocolError(
+            INVALID_PARAMS,
+            f"Malformed request: {_META_CLIENT_CAPABILITIES} is required on every "
+            f"{MODERN_PROTOCOL_VERSION} request and must be an object.",
+            {"missing": [_META_CLIENT_CAPABILITIES]},
+        )
+
+
+def _shape_modern(result: dict[str, object], cacheable: bool) -> dict[str, object]:
+    """Add what the modern revision requires of every result.
+
+    Returns a NEW dict rather than mutating what the handler returned. Handlers
+    are free to hand back module-level data — handle_tools_list already returns
+    a shared TOOL_SCHEMAS list — and injecting keys into such an object would
+    make the first modern request permanently alter what every later request
+    sees, including legacy ones. Cross-request state, in a server whose whole
+    claim is having none.
+    """
+    shaped = dict(result)
+
+    # setdefault, not assignment: a handler that one day returns an
+    # `input_required` result must not have it overwritten with "complete".
+    shaped.setdefault("resultType", "complete")
+
+    meta = shaped.get("_meta")
+    merged: dict[str, object] = dict(meta) if isinstance(meta, dict) else {}
+    merged[_META_SERVER_INFO] = _server_info()
+    shaped["_meta"] = merged
+
+    if cacheable:
+        shaped["ttlMs"] = _CACHE_TTL_MS
+        shaped["cacheScope"] = _CACHE_SCOPE
+    return shaped
 
 
 def dispatch(message: dict[str, object]) -> dict[str, object] | None:
@@ -1312,8 +1595,8 @@ def dispatch(message: dict[str, object]) -> dict[str, object] | None:
     if not isinstance(method, str):
         return None if is_notification else _error(request_id, INVALID_REQUEST, "Missing method.")
 
-    handler = HANDLERS.get(method)
-    if handler is None:
+    entry = HANDLERS.get(method)
+    if entry is None:
         # Notifications MUST NOT be answered, even unknown ones.
         return (
             None
@@ -1328,10 +1611,23 @@ def dispatch(message: dict[str, object]) -> dict[str, object] | None:
     if not isinstance(params, dict):
         params = {}
 
+    # Era classification and validation happen HERE, below both notification
+    # returns above, and that ordering is deliberate. Hoisting them to the top
+    # of this function would make a malformed modern NOTIFICATION produce an
+    # error frame — a reply to a notification, carrying "id": null because a
+    # notification has no id. Two spec violations in one frame, and it looks
+    # like a parse error to the client.
+    #
+    # `params` is passed to the handler by reference and unmodified. See
+    # _read_meta() for why nothing may tidy it up on the way through.
     try:
-        return _response(request_id, handler(params))
+        era = _request_era(entry.era, params)
+        if era == _ERA_MODERN:
+            _validate_modern(params)
+            return _response(request_id, _shape_modern(entry.handler(params), entry.cacheable))
+        return _response(request_id, entry.handler(params))
     except _ProtocolError as exc:
-        return _error(request_id, exc.code, exc.message)
+        return _error(request_id, exc.code, exc.message, exc.data)
     except Exception as exc:  # broad and intentional: the read loop must never die
         _log(f"internal error in {method}: {type(exc).__name__}")
         return _error(request_id, INTERNAL_ERROR, "Internal server error.")

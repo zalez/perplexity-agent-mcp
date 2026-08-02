@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.4.0] - 2026-08-01
+
+### Added
+
+- Support for MCP protocol revision `2026-07-28`, which went GA three days
+  before this release and removes the `initialize` handshake entirely. The
+  server now speaks both eras from one process and decides which one a request
+  wants from what the request itself carries — no flag, no setting, no flag
+  day. Existing clients need no changes and see no difference.
+- `server/discover`, which the modern revision requires of every server. It is
+  answered even when a request carries no `_meta` at all: on stdio it is the
+  designated backward-compatibility probe, and any error there tells a
+  dual-era client "legacy server", a verdict the spec has it cache for the
+  life of the process.
+- `-32022 UnsupportedProtocolVersion` for a modern request naming a revision
+  this server does not speak, carrying the list of versions to retry with.
+  This is deliberately the opposite of `initialize`, which still never errors
+  on version negotiation and downgrades instead — the two rules govern
+  different methods and are pinned by tests from opposite sides.
+- `tests/test_mcp_modern_protocol.py`, 36 tests covering the new era. Every
+  one of them was confirmed to fail against a deliberately broken server
+  before being kept.
+
+### Changed
+
+- `HANDLERS` entries are now records carrying the handler, its protocol era,
+  and whether its result is cacheable, rather than bare callables. A method
+  can no longer be added without answering the era question, and `dispatch()`
+  contains no method names at all.
+- Modern results carry `resultType`, an `io.modelcontextprotocol/serverInfo`
+  in `_meta`, and — for `tools/list` and `server/discover` — `ttlMs` and
+  `cacheScope`. The cache scope is `private` and the TTL is five minutes, both
+  because the tool list reflects this process's `PERPLEXITY_AGENT_WAIT_SECONDS`
+  and this server deliberately never sends `listChanged`, which makes the TTL
+  its only invalidation channel. Legacy results are byte-identical to 0.3.1.
+- `ping` is served in both eras. The modern revision removes it, but nothing
+  forbids answering it, and refusing it could only break a client using it as
+  a liveness check.
+
 ## [0.3.1] - 2026-07-28
 
 ### Fixed
@@ -134,7 +173,8 @@ Initial release.
 - 158 tests, stdlib `unittest` only, requiring no install step for
   contributors either.
 
-[Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zalez/perplexity-agent-mcp/compare/v0.1.0...v0.2.0

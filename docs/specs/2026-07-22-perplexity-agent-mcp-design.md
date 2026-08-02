@@ -700,7 +700,12 @@ failure mode it prevents: a future agent helpfully adding `requests`, or
 
 ## 16. Follow-ons (explicitly out of scope for v0.1.0)
 
-- `server/discover` + stateless `_meta` handling for MCP `2026-07-28`.
+- ~~`server/discover` + stateless `_meta` handling for MCP `2026-07-28`.~~
+  **Done in v0.4.0** — the revision went GA on 2026-07-28 and the server now
+  serves both eras. This document is dated and describes the design as of
+  2026-07-22; where it disagrees with what shipped, see
+  [2026-08-01-mcp-dual-era.md](2026-08-01-mcp-dual-era.md), and above both,
+  the source. Specifically superseded: §3.1's protocol facts table and D2.
 - **MCP Tasks extension** (`2025-11-25`, experimental): the spec-blessed async
   pattern — a task-augmented `tools/call` returns `CreateTaskResult` with
   `taskId` / `ttl` / `pollInterval`, and the client polls `tasks/get`. VS Code

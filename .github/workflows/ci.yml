@@ -180,3 +180,22 @@ jobs:
           grep -q '"perplexity_agent"' /tmp/smoke-out.txt
           grep -q '"perplexity_agent_result"' /tmp/smoke-out.txt
           grep -q '"perplexity_agent_cancel"' /tmp/smoke-out.txt
+      - name: Drive the same script over the modern protocol revision
+        # The wheel has to serve BOTH eras, and the legacy leg above cannot
+        # tell us anything about the modern one. server/discover is sent
+        # without _meta on purpose: that is the backward-compatibility probe,
+        # and answering it is the single behaviour a dual-era client depends on.
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' \
+            | /tmp/smoke/bin/perplexity-agent-mcp > /tmp/smoke-modern.txt
+          cat /tmp/smoke-modern.txt
+          grep -q '"supportedVersions"' /tmp/smoke-modern.txt
+          grep -q '"2026-07-28"' /tmp/smoke-modern.txt
+          # Whitespace-tolerant: _write uses json.dumps' default separators,
+          # so this is '"resultType": "complete"' today. Matching the exact
+          # byte sequence would make a harmless formatting change look like a
+          # protocol regression.
+          grep -qE '"resultType": ?"complete"' /tmp/smoke-modern.txt
+          grep -q '"perplexity_agent"' /tmp/smoke-modern.txt

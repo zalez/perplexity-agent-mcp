@@ -6,7 +6,7 @@
 
 A single-file, zero-third-party-dependency [MCP](https://modelcontextprotocol.io/) server for Perplexity's [Agent API](https://docs.perplexity.ai/docs/agent-api/quickstart) — multi-step web research with citations, exposed to any MCP client over stdio.
 
-Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,478 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
+Python standard library only: no MCP SDK, no HTTP library, no code generated at build time. `perplexity_agent_mcp.py` holds your API key and talks to the network on your behalf, so it is written to be read — 1,774 lines, comments included. Both install paths below ship the exact same file; which one you pick changes how many other parties you're trusting to get it onto your disk, not what actually runs.
 
 > **Background reading:** [*perplexity-agent-mcp: an open-source MCP server for Perplexity's Agent API*](https://constantin.glez.de/posts/2026-07-27-perplexity-agent-mcp-open-source-mcp-server-perplexitys-agent-api/) — why this exists, what the Agent API does that Sonar doesn't, and what building it turned up.
 
@@ -103,7 +103,7 @@ Two things worth getting right, each the difference between a working config and
 
 > **Use an absolute path to `uvx`.** macOS GUI apps — Claude Desktop launched from Finder or Spotlight, not a terminal — do not inherit your shell's `PATH`. If the config above says `"command": "uvx"`, Claude Desktop very likely can't find it and fails with `spawn uvx ENOENT`. Run `which uvx` in your terminal and paste the absolute path it prints into `command` instead.
 
-> **Pin the version if you want reproducibility.** `"args": ["perplexity-agent-mcp@0.3.1"]` holds you on one release. Unpinned, `uv` resolves the newest *published release* on every restart — which is a materially different risk from tracking a branch: releases are immutable, tagged, and go through the same CI as everything else. Pin if you would rather review each upgrade; leave it off if you would rather get fixes automatically. Either is defensible, which is why this is not a warning.
+> **Pin the version if you want reproducibility.** `"args": ["perplexity-agent-mcp@0.4.0"]` holds you on one release. Unpinned, `uv` resolves the newest *published release* on every restart — which is a materially different risk from tracking a branch: releases are immutable, tagged, and go through the same CI as everything else. Pin if you would rather review each upgrade; leave it off if you would rather get fixes automatically. Either is defensible, which is why this is not a warning.
 
 ## Also: a plugin for `llm`
 
@@ -200,6 +200,25 @@ No MCP client publishes Claude Desktop's figure anywhere; we obtained it by reve
 
 Progress notifications do not rescue Claude Desktop: the spec lets a client reset its timeout clock when progress arrives, but only if the client supplied a `progressToken` in the first place, and Claude Desktop never does. This server's `notifications/progress` support is opportunistic — pure upside for the other clients, a no-op here.
 
+## Protocol revisions
+
+This server speaks both eras of MCP, and works out which one you want from what you send. There is nothing to configure, and no way to get it wrong.
+
+| Revision | Era | How a request declares it |
+|---|---|---|
+| `2026-07-28` | Modern — stateless, no handshake | `_meta.io.modelcontextprotocol/protocolVersion` on every request |
+| `2025-11-25` | Legacy — `initialize` handshake | an `initialize` call, or simply no `_meta` |
+| `2025-06-18`, `2025-03-26` | Legacy | negotiated through `initialize` |
+
+`2026-07-28` [went GA on 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/changelog) and removes the `initialize`/`notifications/initialized` handshake entirely: the protocol becomes stateless, every request carries its own protocol version and client capabilities, and servers must implement `server/discover`. It is the largest breaking change in MCP's history.
+
+**Nothing about your setup needs to change.** A legacy client sees byte-identical behaviour to before — that is asserted by exact-equality tests, not by intention. As of this writing no MCP client has publicly shipped `2026-07-28` support, so in practice every client still takes the legacy path; the modern one is here so that none of them has to wait for this server when they do.
+
+Two behaviours worth knowing if you are testing against it:
+
+- **`server/discover` is answered even without `_meta`.** On stdio it is the designated backward-compatibility probe, and a client reads the reply to decide which era this server is. Any error there would tell it "legacy server" permanently.
+- **A modern request naming a revision we don't speak gets `-32022`**, carrying the list it should retry with. That is deliberately the opposite of `initialize`, which never errors on version negotiation and downgrades instead — the two rules govern two different code paths and are not in conflict.
+
 ## Presets
 
 `preset` selects research depth. It's an open string on Perplexity's side too — their API reference types it as a plain `string`, not an enum — which is why this server doesn't constrain it either: a preset Perplexity adds after this README is written still works, unmodified. These are the ones documented today, roughly shallowest to deepest:
@@ -219,7 +238,9 @@ See Perplexity's [presets guide](https://docs.perplexity.ai/docs/agent-api/prese
 
 ## Self-test
 
-No API key needed — `initialize` and `tools/list` never touch the network:
+No API key needed — none of these calls touches the network. There are two of them because this server speaks [two protocol revisions](#protocol-revisions), and they exercise one each.
+
+**Legacy (`2025-11-25`), the handshake era:**
 
 ```bash
 printf '%s\n' \
@@ -230,6 +251,17 @@ printf '%s\n' \
 ```
 
 Expect exactly two JSON lines back: an `initialize` result, then all three tools from `tools/list`. Nothing for the `notifications/initialized` line — the spec forbids replying to notifications, including ones the server doesn't specifically act on.
+
+**Modern (`2026-07-28`), the stateless era:**
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' \
+  | python3 perplexity_agent_mcp.py
+```
+
+Expect two lines again: a `DiscoverResult` listing every revision this server speaks, newest first, then the same three tools — this time carrying `resultType`, `ttlMs`, `cacheScope`, and a `_meta` naming the server. Note that the first line has no `_meta` at all: `server/discover` is answered unconditionally, because on stdio it doubles as the probe a dual-era client uses to find out which era it is talking to.
 
 ## Security
 
@@ -270,6 +302,9 @@ pre-commit run --all-files
 - [Design spec](docs/specs/2026-07-22-perplexity-agent-mcp-design.md) — every
   decision with its rationale, the places the original brief turned out to be
   wrong, and the live verification results.
+- [Dual-era MCP](docs/specs/2026-08-01-mcp-dual-era.md) — why this server
+  speaks two protocol revisions at once, and the three precedence rules that
+  decide which one your request gets.
 - [Blog post](https://constantin.glez.de/posts/2026-07-27-perplexity-agent-mcp-open-source-mcp-server-perplexitys-agent-api/)
   — the story behind the project.
 - [SECURITY.md](SECURITY.md) — threat model, and an honest account of what the

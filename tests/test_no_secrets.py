@@ -264,11 +264,20 @@ class TestKeyNeverLeaks(unittest.TestCase):
             f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
             "import perplexity_agent_mcp as server\n"
             # Stand in for a stray debugging print left inside handler code.
-            "_real_ping = server.handle_ping\n"
+            #
+            # Goes in via _replace rather than by assigning a bare function:
+            # HANDLERS maps a method to a _Method record (handler, era,
+            # cacheable), not to a callable. Assigning a plain function here
+            # instead fails in a memorably unhelpful way -- dispatch raises
+            # AttributeError, the broad except turns it into a -32603, the
+            # frame count and both frame ids still match, and the only
+            # assertion that fails is the sentinel one below, whose message
+            # says this test proved nothing.
+            "_real = server.HANDLERS['ping']\n"
             "def _noisy(params):\n"
             f"    print({PRINT_SENTINEL!r}, flush=True)\n"
-            "    return _real_ping(params)\n"
-            "server.HANDLERS['ping'] = _noisy\n"
+            "    return _real.handler(params)\n"
+            "server.HANDLERS['ping'] = _real._replace(handler=_noisy)\n"
             "raise SystemExit(server.main())\n"
         )
         proc = subprocess.run(

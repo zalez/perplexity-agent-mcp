@@ -170,7 +170,7 @@ neutralized rather than trusted, and that the answer, the source list, and the
   call this server exfiltrate the key just by asking for it back — in the
   same spirit as the [MCP specification's own guidance that `stdio` servers
   should source credentials from the environment rather than accept them as
-  input](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
+  input](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization).
   This server structurally can't — there's no parameter to put one in.
 - **Never logged.** All diagnostics go through `_log()` to stderr as fixed
   strings; the key is never interpolated into a log line.
@@ -185,7 +185,7 @@ neutralized rather than trusted, and that the answer, the source list, and the
   (`request.add_header("Authorization", "Bearer " + _api_key())`). It's never
   stored on a module-level variable or any long-lived object.
 - **Sits in plaintext in your MCP client's config file.** That's not a corner
-  this project cut — it's the [MCP specification's own recommended posture](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+  this project cut — it's the [MCP specification's own recommended posture](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
   for stdio-transport servers: skip OAuth, take credentials from the
   environment, and every MCP client implements that as a plaintext `env` block
   in a JSON file on disk. Worth saying plainly rather than assuming you
