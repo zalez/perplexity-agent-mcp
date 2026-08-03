@@ -213,7 +213,7 @@ are correct and this doc is stale.
 python3 -m unittest discover -v
 
 # `lint` job
-pip install ruff==0.16.0 mypy==2.3.0
+pip install ruff==0.16.1 mypy==2.3.0
 ruff check .
 ruff format --check .
 mypy --strict perplexity_agent_mcp.py
