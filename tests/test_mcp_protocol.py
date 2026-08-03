@@ -535,8 +535,16 @@ class TestToolCallErrors(unittest.TestCase):
         self.assertNotIn("error", replies[1])
         self.assertIs(result["isError"], True)
         text = result["content"][0]["text"]
-        self.assertIn("domain", text, "the offending key must be named so the model self-corrects")
-        self.assertIn("domains", text, "the accepted key should be named too")
+        # Split first. `assertIn("domain", text)` on the whole message would be
+        # satisfied by "domains" in the ACCEPTED list, so it would pass even if
+        # the offending key were never named -- proving nothing while claiming
+        # to prove the thing that matters. Mutation-checked: blanking the
+        # offender from the message must fail this.
+        offending, _, accepted = text.partition("Accepted:")
+        self.assertIn(
+            "domain", offending, "the offending key must be named so the model self-corrects"
+        )
+        self.assertIn("domains", accepted, "the accepted key should be named too")
 
     def test_unknown_argument_key_is_rejected_on_a_differently_shaped_tool_too(self) -> None:
         """Proves the check is driven off EACH tool's own declared schema,
@@ -559,6 +567,53 @@ class TestToolCallErrors(unittest.TestCase):
         result = replies[1]["result"]
         self.assertIs(result["isError"], True)
         self.assertIn("bogus", result["content"][0]["text"])
+
+    def test_a_neighbouring_tools_argument_name_is_rejected_not_ignored(self) -> None:
+        """The third tool, and the one where the realistic typo is not a typo
+        at all but a name borrowed from the tool next door.
+
+        `perplexity_agent` takes `wait` (a boolean). `perplexity_agent_result`
+        takes `wait_seconds` (an integer). A model that has just called the
+        first with `wait: false` and is now collecting the answer has every
+        reason to reach for `wait` again — the two tools are used in sequence,
+        by the same caller, seconds apart.
+
+        Silently accepting it is the bad outcome, and a quiet one: the caller
+        believes it asked to wait, the server applies its default instead, and
+        nothing anywhere reports a disagreement. That is the same shape as the
+        `domain`/`domains` case above, which is why this is worth pinning
+        per-tool rather than trusting the shared implementation.
+
+        No PERPLEXITY_API_KEY is set, so the rejection must come from the
+        argument shape alone, before any upstream call.
+        """
+        replies = run_server(
+            INIT,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "perplexity_agent_result",
+                    "arguments": {"response_id": "resp_x", "wait": False},
+                },
+            },
+        )
+        result = replies[1]["result"]
+        self.assertNotIn("error", replies[1])
+        self.assertIs(result["isError"], True)
+        text = result["content"][0]["text"]
+        # Split on "Accepted:" for the same reason as the test above, and with
+        # more force here: "wait" is a literal prefix of "wait_seconds", so
+        # asserting it against the whole message would be satisfied by the
+        # accepted list alone -- the one key that is guaranteed to be there.
+        offending, _, accepted = text.partition("Accepted:")
+        self.assertIn(
+            "wait", offending, "the offending key must be named so the model self-corrects"
+        )
+        self.assertIn(
+            "wait_seconds", accepted, "and the key it should have used must be named alongside it"
+        )
 
 
 if __name__ == "__main__":
