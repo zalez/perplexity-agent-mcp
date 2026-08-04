@@ -190,3 +190,86 @@ jobs:
 
       - name: Publish
         run: ./mcp-publisher publish
+
+  release:
+    name: cut the GitHub release
+    runs-on: ubuntu-latest
+    # Last in the chain, and only if every publish above succeeded. That
+    # ordering is the point rather than a detail: v0.3.0 published both PyPI
+    # packages and then failed at the registry, and no release was cut for it —
+    # correctly, because a Release is the human-facing "this shipped" marker
+    # and that one only half shipped. `needs: registry` reproduces that
+    # judgement automatically, since the chain is
+    # build -> pypi-server -> pypi-adapter -> registry.
+    needs: registry
+    permissions:
+      # The only job in this repository that can write to the repository, and
+      # it writes exactly one kind of thing. Everything else is contents: read.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Take the release notes from the CHANGELOG
+        # This is step 9 of CONTRIBUTING's release process, which was manual
+        # until now and got missed on v0.4.0 in exactly the way manual steps
+        # do — the tag was pushed, all three publishes went green, and the
+        # release simply never got cut.
+        #
+        # The notes are extracted rather than written a second time: the
+        # CHANGELOG entry already exists, was already reviewed as part of the
+        # release commit, and a hand-written duplicate is one more thing that
+        # can disagree with itself.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > "$RUNNER_TEMP/notes.md"
+          import os
+          import pathlib
+          import re
+          import sys
+
+          version = os.environ["TAG"].lstrip("v")
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+          # This version's heading, up to the next one -- or to the link-ref
+          # block at the foot of the file, which is what follows the OLDEST
+          # entry. Releases are always the newest entry, so the first branch is
+          # what fires in practice; the second stops this being a latent bug.
+          match = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|^\[Unreleased\]:|\Z)",
+              text,
+              re.MULTILINE | re.DOTALL,
+          )
+          if match is None:
+              sys.exit(f"CHANGELOG.md has no '## [{version}]' section")
+
+          body = match.group(1).strip()
+          # An empty section would produce a blank release that still looked
+          # like a success. Fail instead: a silent all-clear is worse than a
+          # red job.
+          if not body:
+              sys.exit(f"CHANGELOG.md's '## [{version}]' section is empty")
+
+          print(body)
+          PY
+          echo "--- notes that will be published ---"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create it
+        # Titled with the bare tag. A human summary like "v0.3.1 — registry
+        # listing" reads better and is worth editing in afterwards, but this
+        # job cannot invent one, and a guessed title would be worse than a
+        # plain one.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — leaving it untouched"
+            exit 0
+          fi
+          gh release create "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

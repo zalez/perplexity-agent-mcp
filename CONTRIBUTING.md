@@ -230,8 +230,16 @@ CI job runs, kept verbatim so you can reproduce any of them individually.
    project name"*. Distinct environments make the tuples distinct. Each PyPI
    project's trusted publisher must name the matching environment. `tests/test_docs_version_pins.py` and the workflow's own
    first step both refuse a tag that disagrees with `__version__`.
-9. Cut a GitHub release from that tag, with release notes summarizing the
-   CHANGELOG entry.
+9. **Nothing.** The `release` job in `publish.yml` cuts the GitHub release
+   for you, once — and only once — all three publishes above have succeeded.
+   It takes the notes straight out of the CHANGELOG section matching the tag,
+   so step 5 is where release notes actually get written.
+
+   This used to be a manual step and was missed on v0.4.0 in precisely the way
+   manual steps are: the tag went up, all three publishes went green, and the
+   release simply never got cut. If a release deserves a better title than the
+   bare tag — `v0.3.1 — registry listing` rather than `v0.3.1` — edit it
+   afterwards. The job will not overwrite a release that already exists.
 
 **Tags are load-bearing, not bookkeeping.** The README's `uvx` install path
 has users point their MCP client config at
