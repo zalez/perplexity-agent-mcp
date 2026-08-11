@@ -50,7 +50,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install pinned tools
-        run: pip install ruff==0.16.1 mypy==2.3.0
+        run: pip install ruff==0.16.2 mypy==2.3.0
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy --strict perplexity_agent_mcp.py
@@ -89,7 +89,7 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
       - name: Install pre-commit
-        run: pip install pre-commit==4.6.1
+        run: pip install pre-commit==4.6.2
       - name: Run every hook that isn't already covered by another job
         # This is the point of the job: 14 of the 18 hooks in
         # .pre-commit-config.yaml (gitleaks, zizmor, actionlint, codespell,
