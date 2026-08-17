@@ -125,10 +125,24 @@ jobs:
         # Editable, and the server first: the adapter pins it exactly, so a
         # non-editable install would fetch the released version from PyPI
         # instead of testing the tree in front of us.
+        #
+        # `httpx` is an UPSTREAM WORKAROUND, not a dependency of ours. Do not
+        # move it into llm-plugin/pyproject.toml: the adapter is allowed
+        # exactly two dependencies and tests/test_no_dependencies.py enforces
+        # that, correctly.
+        #
+        # llm imports httpx directly (llm/models.py) without declaring it,
+        # having relied on `openai` to pull it in. openai 3.1.0 migrated to
+        # `httpx2`, so as of 2026-08-17 a clean `pip install llm` yields an llm
+        # that cannot be imported at all — every adapter test then skips, and
+        # the step below turns those skips into a red job rather than a green
+        # one. Verified in a fresh venv: adding httpx alone fixes it.
+        #
+        # Delete this the moment llm declares httpx itself.
         run: |
           pip install -e .
           pip install -e ./llm-plugin --no-deps
-          pip install 'llm>=0.27' mypy==2.3.0
+          pip install 'llm>=0.27' httpx mypy==2.3.0
       - name: Prove the adapter tests actually ran
         # A skipped test is not a passing test. Fail loudly if the extra did
         # not take, rather than reporting success on 17 skips.
