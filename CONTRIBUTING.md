@@ -37,6 +37,32 @@ exactly how a change passes locally and then fails CI, or the reverse — it
 happened once already on this project, which is why it's a test now instead
 of a memory. If you bump one file's pin, bump the other in the **same PR**.
 
+**That parity test does not cover `pre-commit` itself.** It compares two files
+inside this repository; it cannot see which version of the `pre-commit` binary
+is on your machine. CI installs an exact one (`pip install pre-commit==X.Y.Z`
+in the `pre-commit` job), and `uv tool install pre-commit` gives you whatever
+was current the day you ran it. The two drift apart silently, and nothing
+fails — a hook run at the wrong version still prints `Passed`, which is
+indistinguishable from a hook run at the right one.
+
+It is usually harmless, and it was harmless the day this paragraph was
+written: the gap was 4.5.1 locally against 4.6.2 in CI, and every hook agreed.
+But "my local run was green" is a weaker claim than it sounds if the versions
+differ, so check before leaning on one:
+
+```bash
+pre-commit --version
+grep -o 'pre-commit==[0-9.]*' .github/workflows/ci.yml
+```
+
+If they disagree, either upgrade (`uv tool upgrade pre-commit`) or run the
+pinned version directly without touching your install:
+
+```bash
+uvx --from pre-commit==$(sed -n 's/.*pre-commit==\([0-9.]*\).*/\1/p' \
+  .github/workflows/ci.yml) pre-commit run --all-files
+```
+
 **Pins are checked weekly, but never bumped automatically.** The `pin-check`
 workflow compares every dev-tool pin against its upstream *latest release* and
 files a single tracking issue when one falls behind, rewriting that issue in
