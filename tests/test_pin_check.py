@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import shutil
 import sys
+import tempfile
 import types
 import unittest
+import unittest.mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / ".github" / "scripts" / "check_pins.py"
@@ -116,3 +119,103 @@ class TestReporting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSiteMap(unittest.TestCase):
+    """`--write` is only as good as its map of where each pin actually lives.
+
+    The report has always described those locations in prose. Prose is what
+    let a mypy bump on 2026-08-17 update four of five sites and look finished:
+    `ci.yml` carries `mypy==` twice, and `tests/test_tooling_parity.py` reads
+    only the first, so the gate stayed green over a half-applied bump.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load()
+
+    def test_every_parsed_pin_has_somewhere_to_write(self) -> None:
+        """Guard the guard.
+
+        A hook added to `.pre-commit-config.yaml` is picked up by the parser
+        automatically; if `sites_for` did not also cover it automatically, it
+        would be reported as stale forever and silently skipped by `--write`.
+        """
+        for name, _pinned, _where in self.mod.parse_pins():
+            with self.subTest(tool=name):
+                self.assertTrue(self.mod.sites_for(name), f"{name} has no write site")
+
+    def test_mypy_declares_two_sites_in_ci_not_one(self) -> None:
+        """The specific lesson, pinned as a number.
+
+        If someone consolidates the two `mypy==` lines in `ci.yml`, this fails
+        and they update the count deliberately — rather than `--write` quietly
+        bumping one of them and leaving the type-checker split across versions.
+        """
+        ci_sites = [
+            site
+            for site in self.mod.sites_for("pre-commit/mirrors-mypy")
+            if site.path.name == "ci.yml"
+        ]
+        self.assertEqual(len(ci_sites), 1, "expected exactly one ci.yml site declaration")
+        self.assertEqual(ci_sites[0].occurrences, 2)
+
+    def test_claude_md_is_a_site_for_both_tools_it_quotes(self) -> None:
+        """CLAUDE.md §5 quotes the lint job's pip line verbatim. It has gone
+        stale twice, both times unnoticed until a human read it."""
+        for tool in ("astral-sh/ruff-pre-commit", "pre-commit/mirrors-mypy"):
+            with self.subTest(tool=tool):
+                names = [site.path.name for site in self.mod.sites_for(tool)]
+                self.assertIn("CLAUDE.md", names)
+
+    def test_the_v_prefix_convention_of_each_site_is_preserved(self) -> None:
+        """pre-commit revs are written `v1.2.3`; pip pins are written `1.2.3`.
+        Upstream answers in whichever form it likes, so neither can be copied
+        in as-is."""
+        self.assertEqual(self.mod._retarget("v0.16.2", "0.16.3"), "v0.16.3")
+        self.assertEqual(self.mod._retarget("0.16.2", "v0.16.3"), "0.16.3")
+        self.assertEqual(self.mod._retarget("v0.16.2", "v0.16.3"), "v0.16.3")
+        self.assertEqual(self.mod._retarget("0.16.2", "0.16.3"), "0.16.3")
+
+
+class TestRewriteRefusal(unittest.TestCase):
+    """A partial bump is worse than none: it leaves pins disagreeing while the
+    parity gate still passes. So a site that does not look the way it declares
+    must stop the whole rewrite, before anything is written."""
+
+    def setUp(self) -> None:
+        self.mod = _load()
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def _site(self, name: str, body: str, pattern: str, count: int):
+        path = self.tmp / name
+        path.write_text(body, encoding="utf-8")
+        return self.mod._Site(path, pattern, count)
+
+    def test_a_wrong_occurrence_count_raises_and_writes_nothing(self) -> None:
+        good = self._site("a.yml", "tool==1.0.0\n", self.mod._pip_pattern("tool"), 1)
+        # Declares two, contains one -- the shape this exists to catch.
+        bad = self._site("b.yml", "tool==1.0.0\n", self.mod._pip_pattern("tool"), 2)
+        before = good.path.read_text(encoding="utf-8")
+
+        with unittest.mock.patch.object(self.mod, "sites_for", return_value=(good, bad)):
+            with self.assertRaises(self.mod.PinRewriteError) as ctx:
+                self.mod.rewrite("tool", "2.0.0")
+
+        self.assertIn("b.yml", str(ctx.exception))
+        self.assertIn("found 1", str(ctx.exception))
+        self.assertEqual(
+            good.path.read_text(encoding="utf-8"),
+            before,
+            "the valid site must be untouched -- validation runs before any write",
+        )
+
+    def test_a_matching_plan_rewrites_every_occurrence(self) -> None:
+        twice = self._site(
+            "c.yml", "tool==1.0.0\nother\ntool==1.0.0\n", self.mod._pip_pattern("tool"), 2
+        )
+        with unittest.mock.patch.object(self.mod, "sites_for", return_value=(twice,)):
+            edits = self.mod.rewrite("tool", "2.0.0")
+        self.assertEqual(edits, [(twice.path, 2)])
+        self.assertEqual(twice.path.read_text(encoding="utf-8").count("tool==2.0.0"), 2)
+        self.assertNotIn("1.0.0", twice.path.read_text(encoding="utf-8"))
