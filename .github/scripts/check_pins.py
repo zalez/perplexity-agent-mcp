@@ -206,11 +206,11 @@ class _Site(NamedTuple):
 
     `occurrences` is the load-bearing field. `mypy` appears TWICE in ci.yml —
     once in the `lint` job, once in the `llm adapter` job's type check — and
-    `tests/test_tooling_parity.py` cannot see the second one, because it uses
-    `re.search` and stops at the first. Bumping only what that gate checks is
-    a mistake this repo has actually made, on 2026-08-17, and the gate stayed
-    green through it. Declaring the count here turns a silent partial rewrite
-    into a loud failure.
+    until 2026-08-20 `tests/test_tooling_parity.py` compared only the first,
+    so a bump that updated one and not the other passed. That happened, on
+    2026-08-17. Both guards now count: that one asserts the two agree, this
+    one asserts a rewrite touches both. Declaring the number here is what
+    turns a silent partial write into a loud failure.
     """
 
     path: pathlib.Path

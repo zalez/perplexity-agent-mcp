@@ -95,8 +95,8 @@ jobs:
               echo "### Already done for you"
               echo
               echo "Every version above is already bumped on \`pins/auto\`, across"
-              echo "**all** of its sites — including the two \`mypy==\` lines in"
-              echo "\`ci.yml\`, which \`tests/test_tooling_parity.py\` cannot see."
+              echo "**all** of its sites — including both \`mypy==\` lines in"
+              echo "\`ci.yml\`, which live in two different jobs."
               echo
               echo "**[Open the pull request]($COMPARE_URL)** — review, and merge if CI is green."
               echo
