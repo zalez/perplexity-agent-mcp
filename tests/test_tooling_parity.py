@@ -62,30 +62,51 @@ def _pin_from_precommit_text(text: str, tool: str) -> str | None:
     return None
 
 
-def _pin_from_ci_text(text: str, tool: str) -> str | None:
-    """The version pinned for `tool` on CI's actual `pip install` line.
+def _pins_from_ci_text(text: str, tool: str) -> list[str]:
+    """EVERY version pinned for `tool` on one of CI's `pip install` lines.
 
-    Anchored to a real `run: pip install ...` line via `re.MULTILINE` +
-    `^`: a lookalike mention elsewhere in the file, such as a comment
-    reading "# TODO: bump to ruff==0.16.0", has no `run:` at its own line's
-    start and so cannot satisfy the match, regardless of where it sits
-    relative to the real pin.
+    Plural, and both halves of that are corrections of a real failure.
+
+    This returned only the FIRST match until 2026-08-20, and its pattern
+    additionally required `run:` and `pip install` on the same physical line.
+    `ci.yml` installs mypy twice — the `lint` job on a single-line `run:`, and
+    the `llm adapter` job inside a `run: |` block, where `pip install` sits on
+    a line of its own. So the second pin was not merely deprioritised, it was
+    never matched at all, and this gate had never once compared it. A mypy
+    bump on 2026-08-17 duly updated one and left the other behind, green.
+
+    Anchoring survives the widening: a line's first non-whitespace must be
+    `pip install` or `run: pip install`, so a comment mentioning a version —
+    "# TODO: bump to ruff==0.16.0" — still cannot match, wherever it sits.
 
     The captured token is the full non-whitespace run after `tool==`,
     preserving a pre-release/build suffix intact instead of truncating it
     to a bare `X.Y.Z`.
     """
-    pattern = r"^[ \t]*run:[ \t]*pip install\b.*?\b" + re.escape(tool) + r"==(\S+)"
-    match = re.search(pattern, text, re.MULTILINE)
-    return match.group(1) if match else None
+    pattern = r"^[ \t]*(?:run:[ \t]*)?pip install\b.*?\b" + re.escape(tool) + r"==(\S+)"
+    return re.findall(pattern, text, re.MULTILINE)
 
 
 def _pinned_in_precommit(tool: str) -> str | None:
     return _pin_from_precommit_text(PRE_COMMIT.read_text(encoding="utf-8"), tool)
 
 
-def _pinned_in_ci(tool: str) -> str | None:
-    return _pin_from_ci_text(CI.read_text(encoding="utf-8"), tool)
+def _disagreeing(expected: str, found: list[str]) -> list[tuple[int, str]]:
+    """Every CI occurrence that differs from the pre-commit pin, with its 1-based
+    position so a failure can say WHICH one drifted.
+
+    A separate function purely so it can be tested against a disagreement. In a
+    healthy repository every occurrence agrees, so the comparison inside the
+    assertion below is never meaningfully exercised — narrowing it to the first
+    occurrence would pass every run and be caught by nothing. That is exactly
+    the bug this whole change exists to remove, so it must not be reintroduced
+    one level down.
+    """
+    return [(index, value) for index, value in enumerate(found, start=1) if value != expected]
+
+
+def _pinned_in_ci(tool: str) -> list[str]:
+    return _pins_from_ci_text(CI.read_text(encoding="utf-8"), tool)
 
 
 class TestToolingParity(unittest.TestCase):
@@ -98,12 +119,22 @@ class TestToolingParity(unittest.TestCase):
         or doesn't also check.
         """
         precommit_version = _pinned_in_precommit(precommit_tool)
-        ci_version = _pinned_in_ci(ci_tool)
+        ci_versions = _pinned_in_ci(ci_tool)
         self.assertIsNotNone(
             precommit_version, f"{ci_tool} pin not found in .pre-commit-config.yaml"
         )
-        self.assertIsNotNone(ci_version, f"{ci_tool} pin not found in .github/workflows/ci.yml")
-        self.assertEqual(precommit_version, ci_version)
+        self.assertTrue(ci_versions, f"{ci_tool} pin not found in .github/workflows/ci.yml")
+        assert precommit_version is not None  # narrowed by the assertion above
+        # EVERY occurrence, not just the first. A tool installed in two jobs
+        # must be the same tool in both, and the message names which drifted.
+        drifted = _disagreeing(precommit_version, ci_versions)
+        self.assertEqual(
+            drifted,
+            [],
+            f"{ci_tool} is pinned {precommit_version} in .pre-commit-config.yaml but "
+            f"{len(drifted)} of {len(ci_versions)} occurrence(s) in ci.yml disagree: "
+            + ", ".join(f"#{i}={v}" for i, v in drifted),
+        )
 
     def test_ruff_versions_match(self) -> None:
         self._assert_versions_match("ruff-pre-commit", "ruff")
@@ -121,13 +152,13 @@ class TestToolingParity(unittest.TestCase):
             ("mypy", _pinned_in_ci),
         ):
             with self.subTest(tool=tool):
-                self.assertIsNotNone(getter(tool), f"{tool} must be pinned in CI")
+                self.assertTrue(getter(tool), f"{tool} must be pinned in CI")
 
 
 class TestPinExtractionIgnoresLookalikeComments(unittest.TestCase):
     """`re.search` takes the leftmost match, so an unanchored pattern would
     prefer a comment mentioning the tool over the real pin sitting below
-    it. These prove the structural anchors in `_pin_from_ci_text` /
+    it. These prove the structural anchors in `_pins_from_ci_text` /
     `_pin_from_precommit_text` aren't fooled by that.
     """
 
@@ -137,7 +168,7 @@ class TestPinExtractionIgnoresLookalikeComments(unittest.TestCase):
             "        # TODO: bump to ruff==0.16.0\n"
             "        run: pip install ruff==0.15.22 mypy==2.3.0\n"
         )
-        self.assertEqual(_pin_from_ci_text(text, "ruff"), "0.15.22")
+        self.assertEqual(_pins_from_ci_text(text, "ruff"), ["0.15.22"])
 
     def test_precommit_ignores_a_lookalike_comment_before_the_real_pin(self) -> None:
         text = (
@@ -158,14 +189,14 @@ class TestPinCapturePreservesPrereleaseSuffixes(unittest.TestCase):
 
     def test_ci_capture_keeps_the_rc_suffix_intact(self) -> None:
         text = "        run: pip install ruff==0.16.0rc1 mypy==2.3.0\n"
-        self.assertEqual(_pin_from_ci_text(text, "ruff"), "0.16.0rc1")
+        self.assertEqual(_pins_from_ci_text(text, "ruff"), ["0.16.0rc1"])
 
     def test_rc_pin_is_reported_as_a_mismatch_against_the_final_release(self) -> None:
         ci_text = "        run: pip install ruff==0.16.0rc1 mypy==2.3.0\n"
         precommit_text = (
             "  - repo: https://github.com/astral-sh/ruff-pre-commit\n    rev: v0.16.0\n"
         )
-        ci_version = _pin_from_ci_text(ci_text, "ruff")
+        (ci_version,) = _pins_from_ci_text(ci_text, "ruff")
         precommit_version = _pin_from_precommit_text(precommit_text, "ruff-pre-commit")
         self.assertNotEqual(
             ci_version, precommit_version, "0.16.0rc1 must not be reported as matching 0.16.0"
@@ -221,3 +252,65 @@ class TestActionsArePinnedToShas(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEveryCiOccurrenceIsCompared(unittest.TestCase):
+    """The gate compared one pin per tool until 2026-08-20, and `ci.yml` has
+    installed mypy twice for far longer than that.
+
+    The second install lives inside a `run: |` block, where `pip install` sits
+    on its own line — which the old pattern, requiring `run:` on the same
+    physical line, could not match at all. So this was not a ranking problem
+    to be fixed by preferring a later match; the occurrence was invisible.
+    """
+
+    def test_both_mypy_installs_in_the_real_ci_file_are_found(self) -> None:
+        """Guard the guard, against the real file rather than a fixture.
+
+        `check_pins.py`'s `_EXTRA_SITES` independently declares that `ci.yml`
+        contains exactly two `mypy==`. If a reformat ever hides one from this
+        pattern, the two mechanisms disagree and this fails — rather than the
+        gate quietly going back to checking half of what it claims to.
+        """
+        self.assertEqual(len(_pinned_in_ci("mypy")), 2)
+
+    def test_a_pin_inside_a_block_scalar_is_found(self) -> None:
+        text = (
+            "      - name: Install both distributions\n"
+            "        run: |\n"
+            "          pip install -e .\n"
+            "          pip install 'llm>=0.27' httpx mypy==2.3.1\n"
+        )
+        self.assertEqual(_pins_from_ci_text(text, "mypy"), ["2.3.1"])
+
+    def test_two_occurrences_that_disagree_are_both_reported(self) -> None:
+        """The exact 2026-08-17 shape: one job bumped, the other left behind."""
+        text = (
+            "        run: pip install ruff==0.16.3 mypy==2.3.1\n"
+            "        run: |\n"
+            "          pip install 'llm>=0.27' httpx mypy==2.3.0\n"
+        )
+        self.assertEqual(_pins_from_ci_text(text, "mypy"), ["2.3.1", "2.3.0"])
+
+    def test_widening_the_pattern_did_not_start_matching_comments(self) -> None:
+        """Dropping the mandatory `run:` is the whole fix, so the anchor that
+        rejects lookalike comments now rests entirely on a line's first
+        non-whitespace being `pip install`. Worth asserting directly."""
+        text = (
+            "        # TODO: bump to mypy==9.9.9\n"
+            "        #   pip install mypy==8.8.8\n"
+            "        run: pip install mypy==2.3.1\n"
+        )
+        self.assertEqual(_pins_from_ci_text(text, "mypy"), ["2.3.1"])
+
+    def test_a_disagreement_after_the_first_occurrence_is_still_caught(self) -> None:
+        """The survivor of the first mutation run.
+
+        Narrowing the comparison to `ci_versions[:1]` passed every test,
+        because in a healthy repo every occurrence agrees and there is nothing
+        for a first-only check to miss. Only a fixture where a LATER one
+        drifts can tell the two implementations apart.
+        """
+        self.assertEqual(_disagreeing("2.3.1", ["2.3.1", "2.3.1"]), [])
+        self.assertEqual(_disagreeing("2.3.1", ["2.3.1", "2.3.0"]), [(2, "2.3.0")])
+        self.assertEqual(_disagreeing("2.3.1", ["2.3.0", "2.3.1"]), [(1, "2.3.0")])
