@@ -32,10 +32,15 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
+from typing import NamedTuple
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 PRE_COMMIT = REPO_ROOT / ".pre-commit-config.yaml"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+# CLAUDE.md §5 quotes the lint job's exact pip line, so it is a real pin
+# site — it has gone stale twice, both times unnoticed until someone read it.
+CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
 
 _TIMEOUT = 30
 _USER_AGENT = "perplexity-agent-mcp-pin-check"
@@ -185,18 +190,165 @@ def render(rows: list[tuple[str, str, str | None, str]]) -> tuple[str, bool]:
     return "\n".join(lines), bool(stale)
 
 
-def main() -> int:
+class PinRewriteError(Exception):
+    """A site did not look the way its declaration says it looks."""
+
+
+class _Site(NamedTuple):
+    """One place a pin's version literally appears, and how many times.
+
+    `occurrences` is the load-bearing field. `mypy` appears TWICE in ci.yml —
+    once in the `lint` job, once in the `llm adapter` job's type check — and
+    `tests/test_tooling_parity.py` cannot see the second one, because it uses
+    `re.search` and stops at the first. Bumping only what that gate checks is
+    a mistake this repo has actually made, on 2026-08-17, and the gate stayed
+    green through it. Declaring the count here turns a silent partial rewrite
+    into a loud failure.
+    """
+
+    path: pathlib.Path
+    pattern: str
+    occurrences: int
+
+
+def _rev_pattern(slug: str) -> str:
+    """The `rev:` belonging to one specific repo block.
+
+    Group 1 is everything up to the value, group 2 is the value — so a
+    substitution can keep the surrounding YAML byte-identical, including
+    whatever key order the block happens to use.
+    """
+    return (
+        r"(repo:\s*https://github\.com/"
+        + re.escape(slug)
+        + r"\s*\n(?:[^\n]*\n){0,6}?\s*rev:\s*)(\S+)"
+    )
+
+
+def _pip_pattern(tool: str) -> str:
+    """`tool==VERSION` on a pip install line. Same group convention."""
+    return r"(" + re.escape(tool) + r"==)(\S+)"
+
+
+# Tools whose version appears somewhere OTHER than its own pre-commit `rev:`.
+#
+# Anything absent from this map is assumed to live in exactly one place, which
+# `sites_for` derives — so adding an ordinary hook to .pre-commit-config.yaml
+# needs no edit here, while a tool that grows a second home does. That is the
+# right way round: the dangerous case is the one you have to declare.
+#
+# The report has always said "Update in: .pre-commit-config.yaml + ci.yml" for
+# these two. That was prose, and prose is what let four of five sites get
+# updated and called done. This is the same knowledge, in a form that executes.
+_EXTRA_SITES: dict[str, tuple[_Site, ...]] = {
+    "astral-sh/ruff-pre-commit": (
+        _Site(CI, _pip_pattern("ruff"), 1),
+        _Site(CLAUDE_MD, _pip_pattern("ruff"), 1),
+    ),
+    "pre-commit/mirrors-mypy": (
+        _Site(CI, _pip_pattern("mypy"), 2),
+        _Site(CLAUDE_MD, _pip_pattern("mypy"), 1),
+    ),
+}
+
+
+def sites_for(name: str) -> tuple[_Site, ...]:
+    """Every file+pattern that has to change to bump `name`."""
+    if name == _PRE_COMMIT_PYPI:
+        # Not a pre-commit hook at all: pip-installed in CI, one site.
+        return (_Site(CI, _pip_pattern("pre-commit"), 1),)
+    return (_Site(PRE_COMMIT, _rev_pattern(name), 1), *_EXTRA_SITES.get(name, ()))
+
+
+def _retarget(old: str, new: str) -> str:
+    """Give `new` the `v`-prefix convention of the token it replaces.
+
+    pre-commit revs are written `v0.16.3`; pip pins are written `0.16.3`. The
+    upstream answer arrives in whichever form that upstream happens to use, so
+    neither can simply be copied in.
+    """
+    if old[:1] in "vV" and new[:1] not in "vV":
+        return old[0] + new
+    if old[:1] not in "vV" and new[:1] in "vV":
+        return new.lstrip("vV")
+    return new
+
+
+def rewrite(name: str, latest: str) -> list[tuple[pathlib.Path, int]]:
+    """Point every site for `name` at `latest`. Returns (path, count) per site.
+
+    Refuses to write anything if ANY site matches a different number of times
+    than it declares. A partial bump is worse than none: it leaves the repo
+    with pins that disagree and a parity gate that still passes.
+    """
+    planned: list[tuple[_Site, str, str]] = []
+    for site in sites_for(name):
+        text = site.path.read_text(encoding="utf-8")
+        found = re.findall(site.pattern, text)
+        if len(found) != site.occurrences:
+            raise PinRewriteError(
+                f"{site.path.name}: expected {site.occurrences} occurrence(s) of "
+                f"{name}'s version, found {len(found)}. Refusing to write a partial "
+                f"bump — the file or the pattern changed shape."
+            )
+        planned.append((site, text, re.sub(site.pattern, _substitute(latest), text)))
+
+    # Every site validated before any is written, so a bad declaration cannot
+    # leave half the repo bumped.
+    edits: list[tuple[pathlib.Path, int]] = []
+    for site, _old, new_text in planned:
+        site.path.write_text(new_text, encoding="utf-8")
+        edits.append((site.path, site.occurrences))
+    return edits
+
+
+def _substitute(latest: str) -> Callable[[re.Match[str]], str]:
+    def replace(match: re.Match[str]) -> str:
+        return match.group(1) + _retarget(match.group(2), latest)
+
+    return replace
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Report, and with `--write`, actually bump every stale pin in place.
+
+    `--write` is deliberately a flag rather than the default. Reading is safe
+    and runs weekly on a schedule; writing edits tracked files and belongs to
+    a caller that has decided to open a pull request with the result.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    write = "--write" in args
+
     rows = collect()
     report, stale = render(rows)
 
     print(report)
 
+    bumped: list[str] = []
+    if write:
+        for name, pinned, latest, _where in rows:
+            if not latest or _normalise(pinned) == _normalise(latest):
+                continue
+            try:
+                edits = rewrite(name, latest)
+            except PinRewriteError as exc:
+                # Loud, and non-zero. A refused rewrite means a file no longer
+                # looks the way this script believes it does, which is exactly
+                # when carrying on would produce a half-bumped tree.
+                print(f"::error::{exc}", file=sys.stderr)
+                return 1
+            touched = ", ".join(f"{path.name}x{count}" for path, count in edits)
+            print(f"bumped {name}: {pinned} -> {latest}  ({touched})")
+            bumped.append(f"`{name}` {pinned} -> {latest}")
+
     # The report itself goes to stdout, so the caller can redirect it wherever
-    # it likes; only the yes/no needs the Actions output channel.
+    # it likes; only the machine-readable bits need the Actions output channel.
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as handle:
             handle.write(f"stale={'true' if stale else 'false'}\n")
+            if write:
+                handle.write(f"bumped={'true' if bumped else 'false'}\n")
 
     return 0
 
