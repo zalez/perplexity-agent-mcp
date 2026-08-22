@@ -15,12 +15,19 @@ proposed `gitleaks v8.30.1 -> v8.30.0` — a downgrade of a secret scanner —
 because upstream cut v8.30.1 on a commit that diverged from `master`. This
 script asks for the latest *release* instead, which is what a human checks.
 
-Exits 0 whether or not anything is stale; the caller reads `stale` from
-`$GITHUB_OUTPUT` (or just reads the report). A network failure for one tool is
-reported as "unknown" rather than failing the run, so one flaky endpoint cannot
-turn into a false all-clear or a red workflow.
+Reporting exits 0 whether or not anything is stale; the caller reads `stale`
+from `$GITHUB_OUTPUT` (or just reads the report). A network failure for one tool
+is reported as "unknown" rather than failing the run, so one flaky endpoint
+cannot turn into a false all-clear or a red workflow.
+
+With `--write` it also applies every stale bump in place, to every site that
+version appears in, and sets `bumped` alongside `stale`. That is the only path
+that can exit non-zero: a file which no longer matches its declared shape stops
+the rewrite before anything is written, because a half-applied bump leaves the
+pins disagreeing while `tests/test_tooling_parity.py` still passes.
 
 Run locally with:  GITHUB_TOKEN=$(gh auth token) python3 .github/scripts/check_pins.py
+Add --write to have it do the edits.
 """
 
 from __future__ import annotations

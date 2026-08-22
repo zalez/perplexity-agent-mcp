@@ -63,11 +63,22 @@ uvx --from pre-commit==$(sed -n 's/.*pre-commit==\([0-9.]*\).*/\1/p' \
   .github/workflows/ci.yml) pre-commit run --all-files
 ```
 
-**Pins are checked weekly, but never bumped automatically.** The `pin-check`
-workflow compares every dev-tool pin against its upstream *latest release* and
-files a single tracking issue when one falls behind, rewriting that issue in
-place and closing it once everything is current. It does not open PRs and holds
-no write access to the code.
+**Pins are checked weekly, and the bump is prepared for you.** The `pin-check`
+workflow compares every dev-tool pin against its upstream *latest release*. When
+one falls behind it applies the bump across **every** site that version appears
+in, pushes the result to a machine-owned `pins/auto` branch, and files a single
+tracking issue linking straight to the pull-request form. The issue is rewritten
+in place each run and closes itself once everything is current.
+
+**It stops short of opening the pull request, and that is deliberate.** A PR
+created by `GITHUB_TOKEN` receives no check runs at all — GitHub's loop
+prevention — and `main` requires nine. Such a PR could never be merged. You
+opening it produces an ordinary `pull_request` event, and CI runs normally. Two
+clicks, in exchange for not having to trust a bot with a merge-ready change.
+
+That job is consequently the only one in this repository holding write access,
+scoped to itself: `contents: write` to push the branch, `issues: write` to file
+the reminder. It cannot open a PR, approve one, or touch `main`.
 
 Run it yourself any time:
 
