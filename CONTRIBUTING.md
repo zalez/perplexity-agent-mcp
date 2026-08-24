@@ -63,22 +63,41 @@ uvx --from pre-commit==$(sed -n 's/.*pre-commit==\([0-9.]*\).*/\1/p' \
   .github/workflows/ci.yml) pre-commit run --all-files
 ```
 
-**Pins are checked weekly, and the bump is prepared for you.** The `pin-check`
-workflow compares every dev-tool pin against its upstream *latest release*. When
-one falls behind it applies the bump across **every** site that version appears
-in, pushes the result to a machine-owned `pins/auto` branch, and files a single
-tracking issue linking straight to the pull-request form. The issue is rewritten
-in place each run and closes itself once everything is current.
+**Pins are checked weekly, and the bump is written out for you to apply.** The
+`pin-check` workflow compares every dev-tool pin against its upstream *latest
+release*. When one falls behind it applies the bump across **every** site that
+version appears in, and files a single tracking issue containing the resulting
+diff. The issue is rewritten in place each run and closes itself once
+everything is current. Applying it is one command, run from a fresh branch:
 
-**It stops short of opening the pull request, and that is deliberate.** A PR
-created by `GITHUB_TOKEN` receives no check runs at all — GitHub's loop
-prevention — and `main` requires nine. Such a PR could never be merged. You
-opening it produces an ordinary `pull_request` event, and CI runs normally. Two
-clicks, in exchange for not having to trust a bot with a merge-ready change.
+```bash
+GITHUB_TOKEN=$(gh auth token) python3 .github/scripts/check_pins.py --write
+```
 
-That job is consequently the only one in this repository holding write access,
-scoped to itself: `contents: write` to push the branch, `issues: write` to file
-the reminder. It cannot open a PR, approve one, or touch `main`.
+**It reports the bump rather than pushing it, and that is not a policy
+choice — it is the only thing that works.** `GITHUB_TOKEN` is a GitHub App
+installation token, and GitHub refuses *any* App push that creates or updates
+a file under `.github/workflows/`. There is no permission that grants it: the
+workflow `permissions:` block has no `workflows` key at all, and `actions:
+write` covers the Actions API rather than workflow files. Since `ruff` and
+`mypy` are pinned in `ci.yml`, every bump of either is a workflow-file edit by
+construction — so a pushing pin-checker is refused on the first run that finds
+anything. That is exactly how it went: the push landed in #42, and the first
+scheduled run to find a stale pin ([run 32698539123][pin-check-failure],
+2026-08-24) was rejected. Worse, the failure took the tracking issue with it,
+because the issue step was gated on an output written after the push. A real
+drift went unreported by the one job whose entire purpose is reporting drift.
+
+Both halves of that are now pinned by tests in `tests/test_pin_check.py`: the
+workflow must not ask for `contents: write` or run `git push`, and `stale` must
+reach `$GITHUB_OUTPUT` before any rewrite is attempted, so a failure in the
+bumping can never again silence the nagging.
+
+[pin-check-failure]: https://github.com/zalez/perplexity-agent-mcp/actions/runs/32698539123
+
+That job is consequently the only one in this repository holding any write
+access, scoped to itself and to a single scope: `issues: write`, to file the
+reminder. It cannot push, open a PR, approve one, or touch `main`.
 
 Run it yourself any time:
 
