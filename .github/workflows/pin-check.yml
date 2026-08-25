@@ -131,7 +131,14 @@ jobs:
           fi
 
       - name: Close the tracking issue once everything is current
-        if: steps.check.outputs.stale == 'false'
+        # BOTH conditions, and the second is the load-bearing one. `stale` is
+        # false whenever nothing was found stale — including a run that reached
+        # no upstream at all and therefore compared nothing. Closing on that
+        # alone posts "every pin now matches its upstream latest release" as a
+        # verification the run never performed, and un-reports a real drift
+        # until the next Monday. An unreachable upstream leaves the issue
+        # exactly as it was: neither closed nor rewritten.
+        if: steps.check.outputs.stale == 'false' && steps.check.outputs.unknown == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TITLE: "Dev-tool pins have fallen behind"

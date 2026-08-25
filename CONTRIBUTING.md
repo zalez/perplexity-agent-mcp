@@ -68,7 +68,10 @@ uvx --from pre-commit==$(sed -n 's/.*pre-commit==\([0-9.]*\).*/\1/p' \
 release*. When one falls behind it applies the bump across **every** site that
 version appears in, and files a single tracking issue containing the resulting
 diff. The issue is rewritten in place each run and closes itself once
-everything is current. Applying it is one command, run from a fresh branch:
+everything is current — where "current" means *checked and matching*, not
+merely "nothing was found stale". A run that could not reach some upstream
+leaves the issue exactly as it was, because it has no basis for closing it.
+Applying the bump is one command, run from a fresh branch:
 
 ```bash
 GITHUB_TOKEN=$(gh auth token) python3 .github/scripts/check_pins.py --write
