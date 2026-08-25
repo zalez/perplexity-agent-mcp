@@ -26,6 +26,12 @@ that can exit non-zero: a file which no longer matches its declared shape stops
 the rewrite before anything is written, because a half-applied bump leaves the
 pins disagreeing while `tests/test_tooling_parity.py` still passes.
 
+Nothing here commits or pushes. The CI caller runs `--write` purely to turn the
+edits into a diff it can put in the tracking issue, and throws the tree away.
+An earlier version pushed them to a branch; `GITHUB_TOKEN` is a GitHub App
+token and GitHub refuses any App push touching `.github/workflows/`, which
+every `ruff` or `mypy` bump is. See `.github/workflows/pin-check.yml`.
+
 Run locally with:  GITHUB_TOKEN=$(gh auth token) python3 .github/scripts/check_pins.py
 Add --write to have it do the edits.
 """
@@ -316,12 +322,27 @@ def _substitute(latest: str) -> Callable[[re.Match[str]], str]:
     return replace
 
 
+def _emit(**outputs: str) -> None:
+    """Append machine-readable results to `$GITHUB_OUTPUT`, if there is one.
+
+    The report itself goes to stdout, so the caller can redirect it wherever it
+    likes; only the bits a workflow `if:` has to read need this channel. Absent
+    the variable — every local run — this is a no-op.
+    """
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        for key, value in outputs.items():
+            handle.write(f"{key}={value}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Report, and with `--write`, actually bump every stale pin in place.
 
     `--write` is deliberately a flag rather than the default. Reading is safe
     and runs weekly on a schedule; writing edits tracked files and belongs to
-    a caller that has decided to open a pull request with the result.
+    a caller that has decided to do something with the result.
     """
     args = sys.argv[1:] if argv is None else argv
     write = "--write" in args
@@ -330,6 +351,16 @@ def main(argv: list[str] | None = None) -> int:
     report, stale = render(rows)
 
     print(report)
+
+    # Emitted BEFORE any rewrite is attempted, deliberately. A refused rewrite
+    # returns non-zero a few lines down, and an output written after that point
+    # would never be written at all — so the caller's "file the tracking issue"
+    # step would be skipped by the very failure that most needs reporting. The
+    # nag must not depend on the bump succeeding. That coupling is what took
+    # this whole gate out on 2026-08-24: a failing push meant no issue either,
+    # and a drifted pin went unreported by the thing whose only job is to
+    # report drifted pins.
+    _emit(stale="true" if stale else "false")
 
     bumped: list[str] = []
     if write:
@@ -347,15 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             touched = ", ".join(f"{path.name}x{count}" for path, count in edits)
             print(f"bumped {name}: {pinned} -> {latest}  ({touched})")
             bumped.append(f"`{name}` {pinned} -> {latest}")
-
-    # The report itself goes to stdout, so the caller can redirect it wherever
-    # it likes; only the machine-readable bits need the Actions output channel.
-    output = os.environ.get("GITHUB_OUTPUT")
-    if output:
-        with open(output, "a", encoding="utf-8") as handle:
-            handle.write(f"stale={'true' if stale else 'false'}\n")
-            if write:
-                handle.write(f"bumped={'true' if bumped else 'false'}\n")
+        _emit(bumped="true" if bumped else "false")
 
     return 0
 

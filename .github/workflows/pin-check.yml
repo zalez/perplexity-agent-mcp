@@ -29,80 +29,87 @@ jobs:
     name: check dev-tool pins
     runs-on: ubuntu-latest
     permissions:
-      # This job now writes, which it did not before. Both permissions are
-      # scoped to it alone; every other job in this repository is read-only.
+      contents: read
+      # The only elevated permission in this repository, scoped to this one
+      # job. Every other job everywhere is read-only.
       #
-      # `contents: write` is enough to push a BRANCH and nothing more. It is
-      # deliberately not paired with an automated pull request: a PR opened by
-      # GITHUB_TOKEN receives no check runs at all — GitHub's loop prevention —
-      # and `main` requires nine of them, so such a PR would be permanently
-      # unmergeable. A human opening the PR from this branch produces an
-      # ordinary `pull_request` event, and CI runs normally.
-      contents: write
-      # Enough to file the reminder that points at that branch.
+      # This job used to also hold `contents: write` and push the bump to a
+      # branch. That could never have worked: `GITHUB_TOKEN` is a GitHub App
+      # token, and GitHub refuses ANY App push that creates or updates a file
+      # under `.github/workflows/` — there is no permission you can grant to
+      # change that, because the `permissions:` block has no `workflows` key
+      # at all. `ruff` and `mypy` are pinned in `ci.yml`, so every bump of
+      # either is by definition a workflow-file edit. The push was rejected
+      # on its first real attempt (run 32698539123, 2026-08-24) and took the
+      # tracking issue down with it. The bump is now reported, not pushed.
       issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Compare every pin against its upstream latest release, and bump it
+      - name: Compare every pin against its upstream latest release
         id: check
-        # `--write` both reports AND edits, so one invocation and one round of
-        # upstream requests covers the whole job. Locally the script still
-        # defaults to read-only; writing is something a caller opts into.
+        # `--write` edits the working tree and nothing commits it. That is the
+        # point: the diff it produces is the report. One invocation and one
+        # round of upstream requests yields both the table and the exact patch
+        # a human should apply, and the tree is thrown away with the runner.
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/check_pins.py --write | tee "$RUNNER_TEMP/report.md"
-
-      - name: Push the bumped pins to a branch
-        if: steps.check.outputs.bumped == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: pins/auto
-        # One machine-owned branch, rebuilt from `main` on every run rather
-        # than accumulating one per week. If last week's went unmerged it is
-        # simply replaced by a fresher one, which is what you would want to
-        # look at anyway. Force-pushing is safe precisely because nothing but
-        # this job is supposed to write here.
+        # `pipefail` is load-bearing: the script exits non-zero when a pin site
+        # no longer looks the way it declares, and without this `tee`'s exit
+        # status would mask that into a green run.
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git switch -c "$BRANCH"
-          git commit --all --message 'Bump dev-tool pins to their latest releases'
-          # The checkout above sets persist-credentials: false, so the token is
-          # supplied for this one push and never lands in .git/config where a
-          # later step could read it back.
-          git push --force \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "HEAD:${BRANCH}"
+          python3 .github/scripts/check_pins.py --write | tee "$RUNNER_TEMP/report.md"
 
       - name: Open or update the tracking issue
-        if: steps.check.outputs.stale == 'true'
+        # `always()` because the step above exits non-zero on a refused
+        # rewrite, and that is exactly when someone needs to be told. The
+        # script emits `stale` BEFORE attempting any rewrite so this condition
+        # is answerable even then; see the comment on `_emit` in check_pins.py.
+        if: always() && steps.check.outputs.stale == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TITLE: "Dev-tool pins have fallen behind"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BUMPED: ${{ steps.check.outputs.bumped }}
-          COMPARE_URL: ${{ github.server_url }}/${{ github.repository }}/compare/main...pins/auto?expand=1
         run: |
           set -euo pipefail
           {
             cat "$RUNNER_TEMP/report.md"
             if [ "$BUMPED" = "true" ]; then
               echo
-              echo "### Already done for you"
+              echo "### The bump, ready to apply"
               echo
-              echo "Every version above is already bumped on \`pins/auto\`, across"
-              echo "**all** of its sites — including both \`mypy==\` lines in"
-              echo "\`ci.yml\`, which live in two different jobs."
+              echo "\`check_pins.py --write\` produced this on the run above — every"
+              echo "version in the table, across **all** of its sites, including both"
+              echo "\`mypy==\` lines in \`ci.yml\`, which live in two different jobs:"
               echo
-              echo "**[Open the pull request]($COMPARE_URL)** — review, and merge if CI is green."
+              echo "<details><summary>diff</summary>"
               echo
-              echo "The branch is pushed rather than the PR opened, deliberately: a PR"
-              echo "created by \`GITHUB_TOKEN\` gets no check runs, and \`main\` requires"
-              echo "nine. Opening it yourself is what makes CI run at all."
+              echo '```diff'
+              # Bare `git diff` is exactly the bump: the checkout above is
+              # pristine, and `--write` is the only thing in this job that
+              # touches the tree. Nothing else may edit files before here.
+              git diff
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+              echo "Apply it by running the same command yourself:"
+              echo
+              echo '```bash'
+              echo "git switch -c bump-pins main"
+              echo "GITHUB_TOKEN=\$(gh auth token) python3 .github/scripts/check_pins.py --write"
+              echo "pre-commit run --all-files && python3 -m unittest discover"
+              echo '```'
+              echo
+              echo "This job does not push that itself. \`GITHUB_TOKEN\` is a GitHub App"
+              echo "token, and GitHub refuses any App push touching"
+              echo "\`.github/workflows/\` — which every \`ruff\` or \`mypy\` bump is, since"
+              echo "both are pinned in \`ci.yml\`. No permission grants it: the"
+              echo "\`permissions:\` block has no \`workflows\` key."
             fi
             echo
             echo "---"

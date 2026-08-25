@@ -14,6 +14,7 @@ checks were once vacuously satisfiable when both sides were missing.
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import shutil
 import sys
@@ -219,3 +220,109 @@ class TestRewriteRefusal(unittest.TestCase):
         self.assertEqual(edits, [(twice.path, 2)])
         self.assertEqual(twice.path.read_text(encoding="utf-8").count("tool==2.0.0"), 2)
         self.assertNotIn("1.0.0", twice.path.read_text(encoding="utf-8"))
+
+
+class TestStaleIsReportedEvenWhenTheBumpFails(unittest.TestCase):
+    """The nag must not depend on the bump succeeding.
+
+    On 2026-08-24 it did, and the whole gate went quiet. `--write` had found a
+    real drift and edited it correctly; the workflow step that pushed the
+    result was rejected by GitHub, the job went red, and the step that files
+    the tracking issue never ran — because it was gated on an output the
+    script only wrote after the part that failed. A drifted pin went entirely
+    unreported by the thing whose only job is to report drifted pins.
+
+    The push is gone now, but the coupling is the durable lesson: `stale` is
+    emitted before any rewrite is attempted, so a refused rewrite still exits
+    non-zero AND still tells the caller there is something to say.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load()
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.output = self.tmp / "github_output"
+        self.output.touch()
+
+    def _run_with_a_refused_rewrite(self) -> tuple[int, str]:
+        rows = [("tool", "1.0.0", "2.0.0", "somewhere")]
+        refuse = unittest.mock.Mock(side_effect=self.mod.PinRewriteError("shape changed"))
+        with unittest.mock.patch.object(self.mod, "collect", return_value=rows):
+            with unittest.mock.patch.object(self.mod, "rewrite", refuse):
+                with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)}):
+                    code = self.mod.main(["--write"])
+        return code, self.output.read_text(encoding="utf-8")
+
+    def test_a_refused_rewrite_still_exits_non_zero(self) -> None:
+        code, _ = self._run_with_a_refused_rewrite()
+        self.assertEqual(code, 1, "a file that changed shape must fail loudly")
+
+    def test_a_refused_rewrite_still_emits_stale(self) -> None:
+        _, written = self._run_with_a_refused_rewrite()
+        self.assertIn(
+            "stale=true",
+            written,
+            "the caller gates its tracking issue on this; writing it only after "
+            "the rewrite means a failed rewrite silences the report entirely",
+        )
+
+    def test_bumped_is_not_claimed_when_nothing_was_written(self) -> None:
+        """`stale` survives the failure. `bumped` must not — nothing was."""
+        _, written = self._run_with_a_refused_rewrite()
+        self.assertNotIn("bumped=true", written)
+
+    def test_a_clean_run_emits_both(self) -> None:
+        """The ordering must not have broken the ordinary path."""
+        rows = [("tool", "1.0.0", "1.0.0", "somewhere")]
+        with unittest.mock.patch.object(self.mod, "collect", return_value=rows):
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)}):
+                code = self.mod.main(["--write"])
+        written = self.output.read_text(encoding="utf-8")
+        self.assertEqual(code, 0)
+        self.assertIn("stale=false", written)
+        self.assertIn("bumped=false", written)
+
+
+class TestTheWorkflowDoesNotTryToPush(unittest.TestCase):
+    """`GITHUB_TOKEN` can never push a bump on this repo, so it must not try.
+
+    It is a GitHub App installation token, and GitHub refuses ANY App push
+    that creates or updates a file under `.github/workflows/`. No permission
+    grants it — the workflow `permissions:` block has no `workflows` key at
+    all; `actions: write` covers the Actions API, not workflow files. And
+    `ruff` and `mypy` are pinned in `ci.yml`, so every bump of either IS a
+    workflow-file edit by construction.
+
+    Adding `contents: write` and a push back looks like an obvious
+    improvement — "it already computed the fix, why not commit it?" — and is
+    the exact change that was reverted here. It cannot work. It can only fail
+    on the first run that finds something, which is what happened.
+    """
+
+    WORKFLOW = REPO_ROOT / ".github" / "workflows" / "pin-check.yml"
+
+    def setUp(self) -> None:
+        self.text = self.WORKFLOW.read_text(encoding="utf-8")
+
+    def test_the_job_does_not_request_write_access_to_contents(self) -> None:
+        for line in self.text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue  # the comment explaining this is allowed to say it
+            self.assertNotIn(
+                "contents: write",
+                stripped,
+                "a GITHUB_TOKEN push touching .github/workflows/ is always refused",
+            )
+
+    def test_the_workflow_does_not_push(self) -> None:
+        self.assertNotIn("git push", self.text)
+
+    def test_it_still_holds_the_one_permission_it_needs(self) -> None:
+        """Read-only everywhere would be a silent no-op, not a safe default."""
+        self.assertIn("issues: write", self.text)
+
+    def test_the_tracking_issue_is_filed_even_when_the_step_before_it_fails(self) -> None:
+        """The counterpart to `stale` being emitted early — both halves are
+        needed, and either alone still leaves the nag silenceable."""
+        self.assertIn("always() && steps.check.outputs.stale == 'true'", self.text)
