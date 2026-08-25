@@ -89,33 +89,33 @@ class TestReporting(unittest.TestCase):
         self.mod = _load()
 
     def test_matching_versions_are_not_reported_as_stale(self) -> None:
-        report, stale = self.mod.render([("tool", "v1.2.3", "v1.2.3", "somewhere")])
-        self.assertFalse(stale)
-        self.assertIn("match their upstream latest release", report)
+        result = self.mod.render([("tool", "v1.2.3", "v1.2.3", "somewhere")])
+        self.assertFalse(result.stale)
+        self.assertFalse(result.unknown)
+        self.assertIn("match their upstream latest release", result.text)
 
     def test_the_v_prefix_is_not_a_difference(self) -> None:
         """`1.2.3` pinned against a `v1.2.3` release is the same version."""
-        _, stale = self.mod.render([("tool", "1.2.3", "v1.2.3", "somewhere")])
-        self.assertFalse(stale)
+        self.assertFalse(self.mod.render([("tool", "1.2.3", "v1.2.3", "somewhere")]).stale)
 
     def test_a_real_difference_is_reported(self) -> None:
-        report, stale = self.mod.render([("tool", "v1.2.3", "v1.3.0", "ci.yml")])
-        self.assertTrue(stale)
-        self.assertIn("v1.3.0", report)
-        self.assertIn("ci.yml", report)
+        result = self.mod.render([("tool", "v1.2.3", "v1.3.0", "ci.yml")])
+        self.assertTrue(result.stale)
+        self.assertIn("v1.3.0", result.text)
+        self.assertIn("ci.yml", result.text)
 
     def test_an_unreachable_upstream_is_not_treated_as_current(self) -> None:
         """A network failure must read as 'unknown', never as 'fine'."""
-        report, stale = self.mod.render([("tool", "v1.2.3", None, "ci.yml")])
-        self.assertFalse(stale, "unknown is not stale")
-        self.assertIn("Could not reach upstream", report)
-        self.assertIn("not as current", report)
+        result = self.mod.render([("tool", "v1.2.3", None, "ci.yml")])
+        self.assertFalse(result.stale, "unknown is not stale")
+        self.assertIn("Could not reach upstream", result.text)
+        self.assertIn("not as current", result.text)
 
     def test_the_report_warns_against_autoupdate(self) -> None:
         """The downgrade trap is the whole reason this script exists."""
-        report, _ = self.mod.render([("tool", "v1.2.3", "v1.3.0", "ci.yml")])
-        self.assertIn("autoupdate", report)
-        self.assertIn("downgrade", report)
+        result = self.mod.render([("tool", "v1.2.3", "v1.3.0", "ci.yml")])
+        self.assertIn("autoupdate", result.text)
+        self.assertIn("downgrade", result.text)
 
 
 if __name__ == "__main__":
@@ -326,3 +326,99 @@ class TestTheWorkflowDoesNotTryToPush(unittest.TestCase):
         """The counterpart to `stale` being emitted early — both halves are
         needed, and either alone still leaves the nag silenceable."""
         self.assertIn("always() && steps.check.outputs.stale == 'true'", self.text)
+
+
+class TestUnreachableIsNotCurrent(unittest.TestCase):
+    """ "Nothing was found stale" and "everything is current" are different claims.
+
+    `render` only ever compared the pins it could reach, and reported `stale`
+    for those. That is correct as far as it goes — but a run where every
+    upstream was unreachable finds nothing stale for the trivial reason that it
+    compared nothing, and the caller could not tell the two apart.
+
+    `.github/workflows/pin-check.yml` acted on that: its close step fired on
+    `stale == 'false'` alone, so a network outage during the weekly slot would
+    CLOSE the tracking issue with "Every dev-tool pin now matches its upstream
+    latest release." — a verification the run never performed — and un-report a
+    real drift until the following Monday.
+
+    So `unknown` is now emitted beside `stale`, and closing requires both to be
+    false. Same family as the 2026-08-24 failure the push revert fixed: the nag
+    going quiet for a reason that has nothing to do with the pins.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load()
+
+    def test_a_total_outage_is_unknown_not_current(self) -> None:
+        result = self.mod.render([("a", "1.0.0", None, "x"), ("b", "2.0.0", None, "y")])
+        self.assertFalse(result.stale, "nothing can be stale when nothing was compared")
+        self.assertTrue(result.unknown, "the caller must be able to see that")
+
+    def test_a_total_outage_does_not_claim_every_pin_matches(self) -> None:
+        """The headline is read alone, by someone skimming a closed issue."""
+        result = self.mod.render([("a", "1.0.0", None, "x")])
+        self.assertNotIn("All dev-tool pins match", result.text)
+        self.assertIn("No pin could be checked", result.text)
+
+    def test_a_partial_outage_is_also_unknown(self) -> None:
+        """One unreachable pin is the one that might have drifted.
+
+        Reaching seven of eight is not "current"; it is seven answers and one
+        silence, and the silent one is exactly the one nobody has checked.
+        """
+        result = self.mod.render([("a", "1.0.0", "1.0.0", "x"), ("b", "2.0.0", None, "y")])
+        self.assertFalse(result.stale)
+        self.assertTrue(result.unknown)
+        self.assertIn("1 of 2 pins compared", result.text)
+
+    def test_everything_reachable_and_current_is_not_unknown(self) -> None:
+        """The ordinary green path still says so plainly, and still closes."""
+        result = self.mod.render([("a", "1.0.0", "1.0.0", "x")])
+        self.assertFalse(result.stale)
+        self.assertFalse(result.unknown)
+        self.assertIn("All dev-tool pins match their upstream latest release.", result.text)
+
+    def test_stale_and_unknown_are_independent(self) -> None:
+        """A drift found AND an upstream missed: both flags, not either/or."""
+        result = self.mod.render([("a", "1.0.0", "2.0.0", "x"), ("b", "3.0.0", None, "y")])
+        self.assertTrue(result.stale)
+        self.assertTrue(result.unknown)
+
+
+class TestUnknownReachesTheWorkflow(unittest.TestCase):
+    """The flag is worthless unless it is emitted and acted on."""
+
+    WORKFLOW = REPO_ROOT / ".github" / "workflows" / "pin-check.yml"
+
+    def setUp(self) -> None:
+        self.mod = _load()
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.output = self.tmp / "github_output"
+        self.output.touch()
+
+    def _emitted_for(self, rows) -> str:
+        with unittest.mock.patch.object(self.mod, "collect", return_value=rows):
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)}):
+                self.assertEqual(self.mod.main([]), 0)
+        return self.output.read_text(encoding="utf-8")
+
+    def test_an_outage_emits_unknown_true(self) -> None:
+        written = self._emitted_for([("a", "1.0.0", None, "x")])
+        self.assertIn("stale=false", written)
+        self.assertIn("unknown=true", written)
+
+    def test_a_clean_run_emits_unknown_false(self) -> None:
+        written = self._emitted_for([("a", "1.0.0", "1.0.0", "x")])
+        self.assertIn("stale=false", written)
+        self.assertIn("unknown=false", written)
+
+    def test_the_close_step_requires_both_flags(self) -> None:
+        """`stale == 'false'` alone is the bug. Both, or the issue stays open."""
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "steps.check.outputs.stale == 'false' && steps.check.outputs.unknown == 'false'",
+            text,
+            "closing on `stale` alone closes the tracking issue during an outage",
+        )

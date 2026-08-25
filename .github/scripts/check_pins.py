@@ -16,9 +16,15 @@ because upstream cut v8.30.1 on a commit that diverged from `master`. This
 script asks for the latest *release* instead, which is what a human checks.
 
 Reporting exits 0 whether or not anything is stale; the caller reads `stale`
-from `$GITHUB_OUTPUT` (or just reads the report). A network failure for one tool
-is reported as "unknown" rather than failing the run, so one flaky endpoint
-cannot turn into a false all-clear or a red workflow.
+and `unknown` from `$GITHUB_OUTPUT` (or just reads the report). A network
+failure for one tool is reported as "unknown" rather than failing the run, so
+one flaky endpoint cannot turn into a red workflow.
+
+**Unreachable is a third state, not a quiet "current".** `stale` answers "did
+anything drift?", `unknown` answers "was anything left unchecked?", and only
+both together license the claim that every pin is up to date. A caller that
+closes its tracking issue on `stale == false` alone will close it during an
+outage, asserting a comparison that never happened. See `render` and `Report`.
 
 With `--write` it also applies every stale bump in place, to every site that
 version appears in, and sets `bumped` alongside `stale`. That is the only path
@@ -164,14 +170,39 @@ def collect() -> list[tuple[str, str, str | None, str]]:
     return rows
 
 
-def render(rows: list[tuple[str, str, str | None, str]]) -> tuple[str, bool]:
-    """Build the markdown report and say whether anything is stale."""
+class Report(NamedTuple):
+    """What one comparison run concluded, in a form a workflow `if:` can read.
+
+    `stale` and `unknown` are deliberately separate, and neither implies the
+    other. "Nothing is stale" is not the same claim as "everything is
+    current": a pin whose upstream could not be reached is neither, and
+    collapsing the two makes an outage indistinguishable from a clean bill of
+    health. See `render`.
+    """
+
+    text: str
+    stale: bool
+    unknown: bool
+
+
+def render(rows: list[tuple[str, str, str | None, str]]) -> Report:
+    """Build the markdown report, and say what it actually established.
+
+    Three states, not two. A pin is stale, current, or **unchecked** — and the
+    third is why this returns `unknown` alongside `stale`. If every upstream is
+    unreachable, nothing is stale simply because nothing was compared, and a
+    caller reading `stale` alone would conclude that all pins are current on a
+    run that checked none of them. `.github/workflows/pin-check.yml` acts on
+    that conclusion by closing the tracking issue, so the distinction is not
+    cosmetic: it decides whether a real drift stays reported through an outage.
+    """
     stale = [
         (name, pin, latest, where)
         for name, pin, latest, where in rows
         if latest and _normalise(pin) != _normalise(latest)
     ]
     unknown = [name for name, _, latest, _ in rows if latest is None]
+    compared = len(rows) - len(unknown)
 
     lines: list[str] = []
     if stale:
@@ -190,6 +221,16 @@ def render(rows: list[tuple[str, str, str | None, str]]) -> tuple[str, bool]:
             "`ruff` and `mypy` live in two files and must move together, or "
             "`tests/test_tooling_parity.py` fails — which is the gate working."
         )
+    elif not compared:
+        # Every headline below has to survive being read alone, by someone
+        # skimming. "All pins match" on a run that compared nothing is the
+        # false all-clear this function exists to avoid stating.
+        lines.append("No pin could be checked — every upstream was unreachable.")
+    elif unknown:
+        lines.append(
+            f"{compared} of {len(rows)} pins compared; all of those match their "
+            "upstream latest release. The rest could not be checked."
+        )
     else:
         lines.append("All dev-tool pins match their upstream latest release.")
 
@@ -197,10 +238,11 @@ def render(rows: list[tuple[str, str, str | None, str]]) -> tuple[str, bool]:
         lines.append("")
         lines.append(
             "Could not reach upstream for: " + ", ".join(f"`{n}`" for n in unknown) + ". "
-            "Treated as unknown, not as current."
+            "Treated as unknown, not as current — this run cannot say whether those "
+            "pins are current, so the tracking issue is left exactly as it was."
         )
 
-    return "\n".join(lines), bool(stale)
+    return Report("\n".join(lines), bool(stale), bool(unknown))
 
 
 class PinRewriteError(Exception):
@@ -348,9 +390,18 @@ def main(argv: list[str] | None = None) -> int:
     write = "--write" in args
 
     rows = collect()
-    report, stale = render(rows)
+    report = render(rows)
 
-    print(report)
+    print(report.text)
+    if report.unknown:
+        # A warning annotation, not an error: one flaky endpoint must not turn
+        # a scheduled run red. But an outage that silently suppresses the whole
+        # comparison should be visible on the run summary rather than only to
+        # whoever scrolls the log.
+        print(
+            "::warning::Some upstreams were unreachable; this run compared fewer pins",
+            file=sys.stderr,
+        )
 
     # Emitted BEFORE any rewrite is attempted, deliberately. A refused rewrite
     # returns non-zero a few lines down, and an output written after that point
@@ -360,7 +411,10 @@ def main(argv: list[str] | None = None) -> int:
     # this whole gate out on 2026-08-24: a failing push meant no issue either,
     # and a drifted pin went unreported by the thing whose only job is to
     # report drifted pins.
-    _emit(stale="true" if stale else "false")
+    _emit(
+        stale="true" if report.stale else "false",
+        unknown="true" if report.unknown else "false",
+    )
 
     bumped: list[str] = []
     if write:
