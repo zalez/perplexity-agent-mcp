@@ -50,7 +50,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install pinned tools
-        run: pip install ruff==0.16.5 mypy==2.3.1
+        run: pip install ruff==0.16.6 mypy==2.3.1
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy --strict perplexity_agent_mcp.py
