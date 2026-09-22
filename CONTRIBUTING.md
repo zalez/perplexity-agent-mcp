@@ -216,9 +216,12 @@ python3 -m unittest discover -v   # the whole suite; no network access needed
 ruff check .
 ruff format --check .
 mypy --strict perplexity_agent_mcp.py
-pre-commit run --all-files        # all 18 hooks: file hygiene, ruff, mypy,
+GH_TOKEN=$(gh auth token) pre-commit run --all-files
+                                   # all 18 hooks: file hygiene, ruff, mypy,
                                    # gitleaks, actionlint, zizmor, codespell,
-                                   # and the unittest suite again
+                                   # and the unittest suite again. The token
+                                   # lets zizmor run its online audits; without
+                                   # it zizmor passes offline and skips them.
 ```
 
 **A green `pre-commit run --all-files` is necessary but not sufficient.**

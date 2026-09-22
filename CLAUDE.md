@@ -220,11 +220,15 @@ mypy --strict perplexity_agent_mcp.py
 
 # `pre-commit` job — the other 14 hooks (file hygiene, gitleaks, actionlint,
 # zizmor, codespell); ruff/mypy/unittest are skipped here since the two jobs
-# above already cover them against the same pinned versions
-SKIP=ruff-check,ruff-format,mypy,unittest pre-commit run --all-files --show-diff-on-failure
+# above already cover them against the same pinned versions. zizmor gets a
+# step of its own so that only it sees the token: without one it silently
+# runs offline and skips its online audits (impostor-commit and others).
+SKIP=ruff-check,ruff-format,mypy,unittest,zizmor pre-commit run --all-files --show-diff-on-failure
+GH_TOKEN=$(gh auth token) pre-commit run zizmor --all-files --verbose  # must not say "offline mode"
 
 # equivalent, and what you actually want locally day to day: run every hook
-pre-commit run --all-files
+# (the token is what makes zizmor's online audits run here too)
+GH_TOKEN=$(gh auth token) pre-commit run --all-files
 
 # `package` job — build the wheel, install into a clean venv, drive the real
 # console script over pipes, once per protocol era
