@@ -99,12 +99,12 @@ jobs:
         # and the file-hygiene checks; zizmor in the step after this one)
         # previously ran ONLY on machines that had `pre-commit install`, so
         # were fully bypassable via --no-verify or an edit through the
-        # GitHub web UI. Running the
-        # suite here closes that gap. ruff-check/ruff-format/mypy are
-        # skipped because the `lint` job above already runs them against
-        # the same pinned versions (tests/test_tooling_parity.py enforces
-        # that); unittest is skipped because the `test` matrix already runs
-        # it across all five supported Pythons, not just this job's one.
+        # GitHub web UI. Running the suite here closes that gap.
+        # ruff-check/ruff-format/mypy are skipped because the `lint` job
+        # above already runs them against the same pinned versions
+        # (tests/test_tooling_parity.py enforces that); unittest is skipped
+        # because the `test` matrix already runs it across all five
+        # supported Pythons, not just this job's one.
         # Skipping both avoids running identical checks twice for no reason.
         # zizmor is skipped here only to run in the next step, with a token.
         run: |
