@@ -81,7 +81,10 @@ jobs:
         #
         # Cost of removing it instead: measured 70s cold vs 5s warm, on every
         # PR, to defend against an attacker who by definition already won.
-        # Note this job holds no secrets and runs `contents: read`.
+        # The job runs `contents: read`. Its one credential is the job's own
+        # read-only GITHUB_TOKEN, handed to the zizmor step alone (see below).
+        # Ground 3 covers it: whoever can write this cache already holds more
+        # than that token grants.
         # zizmor: ignore[cache-poisoning]
         if: github.ref_type != 'tag'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -93,18 +96,51 @@ jobs:
       - name: Run every hook that isn't already covered by another job
         # This is the point of the job: 14 of the 18 hooks in
         # .pre-commit-config.yaml (gitleaks, zizmor, actionlint, codespell,
-        # and the file-hygiene checks) previously ran ONLY on machines that
-        # had `pre-commit install`, so were fully bypassable via
-        # --no-verify or an edit through the GitHub web UI. Running the
+        # and the file-hygiene checks; zizmor in the step after this one)
+        # previously ran ONLY on machines that had `pre-commit install`, so
+        # were fully bypassable via --no-verify or an edit through the
+        # GitHub web UI. Running the
         # suite here closes that gap. ruff-check/ruff-format/mypy are
         # skipped because the `lint` job above already runs them against
         # the same pinned versions (tests/test_tooling_parity.py enforces
         # that); unittest is skipped because the `test` matrix already runs
         # it across all five supported Pythons, not just this job's one.
         # Skipping both avoids running identical checks twice for no reason.
+        # zizmor is skipped here only to run in the next step, with a token.
         run: |
-          SKIP=ruff-check,ruff-format,mypy,unittest \
+          SKIP=ruff-check,ruff-format,mypy,unittest,zizmor \
             pre-commit run --all-files --show-diff-on-failure
+      - name: zizmor, including its online audits
+        # Without a token zizmor silently runs offline: it prints one WARN line
+        # and still passes. That skips the audits that need the GitHub API,
+        # including `impostor-commit` (does each pinned SHA really belong to the
+        # repo it names?) and `known-vulnerable-actions`. For a repo whose
+        # supply-chain story rests on SHA-pinned Actions, those are the audits
+        # that matter most, and until this step they had never run anywhere.
+        #
+        # Its own step so the token reaches zizmor and no other hook. It still
+        # goes through pre-commit, so the version stays the one
+        # .pre-commit-config.yaml pins and check_pins.py bumps. A second
+        # `pip install zizmor==` here would be a pin site nothing tracks.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The grep turns a silent fallback into a failure. If the token ever
+        # stops arriving, zizmor would go back to passing offline, and a green
+        # check would again claim audits that never ran. `--verbose` is what
+        # makes pre-commit show a passing hook's output at all.
+        #
+        # zizmor has no flag that *requires* online mode, so the guard matches
+        # the wording of its WARN line ("running in offline mode by default",
+        # stable across 1.29.0-1.30.1). When bumping zizmor, rerun this step
+        # once with GH_TOKEN unset: it must still fail. If it passes, the
+        # wording changed and this grep has gone dead.
+        run: |
+          set -euo pipefail
+          pre-commit run zizmor --all-files --verbose 2>&1 | tee "$RUNNER_TEMP/zizmor.log"
+          if grep -q "offline mode" "$RUNNER_TEMP/zizmor.log"; then
+            echo "::error::zizmor ran offline; its online audits were skipped"
+            exit 1
+          fi
 
   llm-adapter:
     name: llm adapter
