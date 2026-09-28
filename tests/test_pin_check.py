@@ -13,7 +13,9 @@ checks were once vacuously satisfiable when both sides were missing.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import pathlib
 import shutil
@@ -36,6 +38,18 @@ def _load() -> types.ModuleType:
     sys.modules["check_pins"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _run_main(module: types.ModuleType, argv: list[str]) -> int:
+    """Call the checker's `main()` with its stdout and stderr swallowed.
+
+    `main()` prints a real report — fixture rows and all — so left uncaptured
+    it lands in the terminal of whoever runs the suite, where "Could not reach
+    upstream for: `a`" reads like a genuine outage on a genuine pin.
+    Assertions go against `GITHUB_OUTPUT` and the exit code, never this text.
+    """
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return module.main(argv)
 
 
 class TestParsing(unittest.TestCase):
@@ -116,10 +130,6 @@ class TestReporting(unittest.TestCase):
         result = self.mod.render([("tool", "v1.2.3", "v1.3.0", "ci.yml")])
         self.assertIn("autoupdate", result.text)
         self.assertIn("downgrade", result.text)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestSiteMap(unittest.TestCase):
@@ -250,7 +260,7 @@ class TestStaleIsReportedEvenWhenTheBumpFails(unittest.TestCase):
         with unittest.mock.patch.object(self.mod, "collect", return_value=rows):
             with unittest.mock.patch.object(self.mod, "rewrite", refuse):
                 with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)}):
-                    code = self.mod.main(["--write"])
+                    code = _run_main(self.mod, ["--write"])
         return code, self.output.read_text(encoding="utf-8")
 
     def test_a_refused_rewrite_still_exits_non_zero(self) -> None:
@@ -276,7 +286,7 @@ class TestStaleIsReportedEvenWhenTheBumpFails(unittest.TestCase):
         rows = [("tool", "1.0.0", "1.0.0", "somewhere")]
         with unittest.mock.patch.object(self.mod, "collect", return_value=rows):
             with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)}):
-                code = self.mod.main(["--write"])
+                code = _run_main(self.mod, ["--write"])
         written = self.output.read_text(encoding="utf-8")
         self.assertEqual(code, 0)
         self.assertIn("stale=false", written)
@@ -401,7 +411,7 @@ class TestUnknownReachesTheWorkflow(unittest.TestCase):
     def _emitted_for(self, rows) -> str:
         with unittest.mock.patch.object(self.mod, "collect", return_value=rows):
             with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)}):
-                self.assertEqual(self.mod.main([]), 0)
+                self.assertEqual(_run_main(self.mod, []), 0)
         return self.output.read_text(encoding="utf-8")
 
     def test_an_outage_emits_unknown_true(self) -> None:
@@ -422,3 +432,7 @@ class TestUnknownReachesTheWorkflow(unittest.TestCase):
             text,
             "closing on `stale` alone closes the tracking issue during an outage",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
