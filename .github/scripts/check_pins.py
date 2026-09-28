@@ -44,6 +44,7 @@ Add --write to have it do the edits.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pathlib
@@ -386,8 +387,19 @@ def main(argv: list[str] | None = None) -> int:
     and runs weekly on a schedule; writing edits tracked files and belongs to
     a caller that has decided to do something with the result.
     """
-    args = sys.argv[1:] if argv is None else argv
-    write = "--write" in args
+    # A real parser, not `"--write" in argv`: that ignored everything else, so
+    # a typo like `--wirte` ran as a clean read-only check and exited 0 — which
+    # looks exactly like "nothing to bump". argparse refuses unknown flags with
+    # exit 2, and does so before `collect()` touches the network.
+    parser = argparse.ArgumentParser(
+        description="Compare dev-tool pins against their latest upstream releases."
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="apply every stale bump in place (never commits or pushes)",
+    )
+    write = parser.parse_args(argv).write
 
     rows = collect()
     report = render(rows)
