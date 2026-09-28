@@ -250,10 +250,6 @@ class TestActionsArePinnedToShas(unittest.TestCase):
                 )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestEveryCiOccurrenceIsCompared(unittest.TestCase):
     """The gate compared one pin per tool until 2026-08-20, and `ci.yml` has
     installed mypy twice for far longer than that.
@@ -314,3 +310,7 @@ class TestEveryCiOccurrenceIsCompared(unittest.TestCase):
         self.assertEqual(_disagreeing("2.3.1", ["2.3.1", "2.3.1"]), [])
         self.assertEqual(_disagreeing("2.3.1", ["2.3.1", "2.3.0"]), [(2, "2.3.0")])
         self.assertEqual(_disagreeing("2.3.1", ["2.3.0", "2.3.1"]), [(1, "2.3.0")])
+
+
+if __name__ == "__main__":
+    unittest.main()
