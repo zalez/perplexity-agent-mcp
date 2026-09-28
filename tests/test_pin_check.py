@@ -434,5 +434,43 @@ class TestUnknownReachesTheWorkflow(unittest.TestCase):
         )
 
 
+class TestUnrecognisedArgumentsAreRefused(unittest.TestCase):
+    """`--wirte` must not quietly mean "read-only".
+
+    `main()` once checked `"--write" in args` and ignored everything else, so a
+    typo ran the full network check, bumped nothing, and exited 0 — the same
+    output as a clean read-only run. `--help` did the same.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load()
+        self.collect = unittest.mock.Mock(return_value=[])
+        patcher = unittest.mock.patch.object(self.mod, "collect", self.collect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # CI sets GITHUB_OUTPUT on every step; without this, the `--write` case
+        # would append its fixture results to the test job's real output file.
+        env = unittest.mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("GITHUB_OUTPUT", None)
+
+    def test_a_typo_exits_non_zero_before_checking_anything(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            _run_main(self.mod, ["--wirte"])
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.collect.assert_not_called()
+
+    def test_help_exits_cleanly_before_checking_anything(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            _run_main(self.mod, ["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.collect.assert_not_called()
+
+    def test_write_is_still_accepted(self) -> None:
+        self.assertEqual(_run_main(self.mod, ["--write"]), 0)
+        self.collect.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
